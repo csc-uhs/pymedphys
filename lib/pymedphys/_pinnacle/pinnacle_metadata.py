@@ -392,14 +392,67 @@ def derive_approval_fields(plan):
     }
 
 
+# Recognised values for the ``DICOM_EXPORT.APPROVAL_STATUS`` config key.
+#
+# "UNAPPROVED" (the default) always exports UNAPPROVED regardless of the
+# Pinnacle lock state.  "AUTO" restores the lock-derived behaviour, where a
+# locked plan exports as APPROVED.
+#
+# The default is deliberately the conservative one.  A converted plan that
+# arrives at an OIS already marked APPROVED can be scheduled and treated
+# without a human ever having reviewed the conversion itself, and this
+# exporter's own geometry is not yet validated.  Exporting APPROVED is
+# therefore something a site opts into once it trusts the pipeline, not
+# something it inherits by accident from a Pinnacle lock that attests to a
+# different thing entirely.
+_APPROVAL_MODES = ("UNAPPROVED", "AUTO")
+_DEFAULT_APPROVAL_MODE = "UNAPPROVED"
+
+
+def resolve_approval_mode(plan):
+    """Return the configured approval mode for *plan*.
+
+    Reads ``DICOM_EXPORT.APPROVAL_STATUS`` via
+    ``plan.pinnacle.export_cfg``. Unrecognised or absent values fall back
+    to ``"UNAPPROVED"``.
+    """
+    cfg = getattr(getattr(plan, "pinnacle", None), "export_cfg", None) or {}
+    mode = str(cfg.get("APPROVAL_STATUS", "") or "").strip().upper()
+    if mode in _APPROVAL_MODES:
+        return mode
+    if mode:
+        plan.logger.warning(
+            "Unrecognised DICOM_EXPORT.APPROVAL_STATUS value %r; expected one "
+            "of %s. Falling back to %s.",
+            mode,
+            ", ".join(_APPROVAL_MODES),
+            _DEFAULT_APPROVAL_MODE,
+        )
+    return _DEFAULT_APPROVAL_MODE
+
+
 def apply_approval_status(ds, plan):
-    """Set ApprovalStatus (and audit fields) on *ds* from the plan lock.
+    """Set ApprovalStatus (and audit fields) on *ds*.
 
     ReviewDate / ReviewTime / ReviewerName are Type 2C — required when
     ApprovalStatus is APPROVED or REJECTED — so they are written (possibly
     empty) whenever the status is not UNAPPROVED.
     """
+    mode = resolve_approval_mode(plan)
     fields = derive_approval_fields(plan)
+
+    if mode == "UNAPPROVED":
+        ds.ApprovalStatus = "UNAPPROVED"
+        if fields["status"] == "APPROVED":
+            plan.logger.info(
+                "Plan is locked in Pinnacle, but ApprovalStatus is exported "
+                "as UNAPPROVED because DICOM_EXPORT.APPROVAL_STATUS is %r. "
+                "Set it to 'AUTO' to carry the Pinnacle lock through as "
+                "APPROVED.",
+                _DEFAULT_APPROVAL_MODE,
+            )
+        return
+
     ds.ApprovalStatus = fields["status"]
     if fields["status"] != "UNAPPROVED":
         ds.ReviewDate = fields["review_date"]

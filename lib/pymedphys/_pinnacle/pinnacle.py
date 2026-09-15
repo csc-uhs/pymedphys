@@ -66,7 +66,7 @@ class PinnacleExport:
             Logger the tool will log to.
     """
 
-    def __init__(self, path, logger=None, equipment_cfg=None):
+    def __init__(self, path, logger=None, equipment_cfg=None, export_cfg=None):
         # Show a warning to ensure that this module is used with caution
         warnings.warn(
             "The Pinnacle Export Module is intended for research purposes only. Parts "
@@ -90,6 +90,10 @@ class PinnacleExport:
         # When non-empty the RT and synthesised-image converters will
         # compose Pinnacle-originated values with site-specific suffixes.
         self._equipment_cfg = equipment_cfg or {}
+
+        # Export behaviour overrides loaded from config.json (the
+        # ``DICOM_EXPORT`` section).  Currently carries ``APPROVAL_STATUS``.
+        self._export_cfg = export_cfg or {}
 
         if not self._logger:
             self._logger = logging.getLogger(__name__)
@@ -127,6 +131,18 @@ class PinnacleExport:
             if not supplied at construction time.
         """
         return self._equipment_cfg
+
+    @property
+    def export_cfg(self):
+        """Gets the DICOM export behaviour configuration.
+
+        Returns
+        -------
+        export_cfg : dict
+            ``DICOM_EXPORT`` section from ``config.json``, or ``{}``
+            if not supplied at construction time.
+        """
+        return self._export_cfg
 
     @property
     def patient_info(self):

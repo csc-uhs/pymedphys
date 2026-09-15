@@ -327,6 +327,20 @@ def _leaf_boundaries_from_machine(machine, expected_pairs, logger):
         except (TypeError, ValueError):
             return None
 
+    # Leaf *positions* are read from the control point in LeafPairList's
+    # stored order, so that order has to already be ascending in Y for the
+    # positions to line up with the boundary table built below.  Sorting
+    # the table without checking would quietly pair leaf 1's position with
+    # leaf 80's boundary.
+    if geometry != sorted(geometry, key=lambda cw: cw[0]):
+        logger.warning(
+            "Machine MultiLeaf LeafPairList is not stored in ascending "
+            "Y order. Leaf positions are read in stored order, so the "
+            "boundary table cannot be safely matched to them and this "
+            "trial's RTPLAN export will fail.",
+        )
+        return None
+
     if len(geometry) != expected_pairs:
         logger.warning(
             "Machine MultiLeaf data describes %d leaf pairs but the plan "
@@ -356,6 +370,35 @@ def _leaf_boundaries_from_machine(machine, expected_pairs, logger):
             return None
 
     return [_format_ds(b) for b in boundaries]
+
+
+def _reject_negated_leaf_coordinates(machine, beam_name):
+    """Refuse export when the machine negates its leaf coordinates.
+
+    Raises
+    ------
+    MachineDataNotFoundError
+        When ``MultiLeaf.NegateLeafCoordinates`` is set.
+    """
+    if not isinstance(machine, dict):
+        return
+    multileaf = machine.get("MultiLeaf") or machine.get("MultiLeafLayout")
+    if not isinstance(multileaf, dict):
+        return
+
+    raw = multileaf.get("NegateLeafCoordinates")
+    if raw in (None, "", 0, "0", False):
+        return
+
+    raise MachineDataNotFoundError(
+        f"Beam '{beam_name}': the machine's MultiLeaf data sets "
+        f"NegateLeafCoordinates to {raw!r}. The Pinnacle-to-DICOM leaf "
+        f"bank mapping used here has only been verified against machines "
+        f"that leave this flag clear, and applying it to a machine that "
+        f"negates its leaf coordinates would mirror every leaf pair "
+        f"without any visible sign of error. This trial's RTPLAN export "
+        f"is refused."
+    )
 
 
 def _resolve_beam_isocenter(plan, beam):
@@ -412,6 +455,184 @@ def _resolve_beam_isocenter(plan, beam):
     )
 
 
+# Tolerance within which a beam's accumulated Pinnacle control-point weights
+# are treated as "should have been exactly 1.0" and renormalised.
+_WEIGHT_NORMALISE_TOL = 1e-2
+
+
+def _normalise_cumulative_weights(weights, beam_name, logger):
+    """Rescale cumulative meterset weights so the final value is exactly 1.0.
+
+    Pinnacle writes per-control-point weights to finite precision, so
+    accumulating them in float arithmetic lands on e.g. 0.999998 rather
+    than 1.  DICOM does not require FinalCumulativeMetersetWeight to be
+    1, but Pinnacle's own export writes 1 and downstream systems compare
+    against it, so float noise below *_WEIGHT_NORMALISE_TOL* is scaled
+    away.  Scaling is dose-neutral: the delivered fraction at each
+    control point is CumulativeMetersetWeight / FinalCumulativeMeterset-
+    Weight, which the rescaling leaves unchanged.
+
+    A total further from 1.0 than the tolerance is left untouched and
+    warned about — that is a data problem rather than accumulated
+    rounding, and rescaling would hide it.
+
+    Returns ``(weights, final_weight)``.
+    """
+    if not weights:
+        return weights, 0.0
+
+    final = weights[-1]
+    if final <= 0:
+        return weights, final
+
+    if abs(final - 1.0) <= _WEIGHT_NORMALISE_TOL:
+        if final != 1.0:
+            logger.debug(
+                "Beam '%s': cumulative meterset weights totalled %r; "
+                "rescaling so FinalCumulativeMetersetWeight is exactly 1.",
+                beam_name,
+                final,
+            )
+        return [w / final for w in weights], 1.0
+
+    logger.warning(
+        "Beam '%s': cumulative meterset weights total %s, more than %s from "
+        "1.0. FinalCumulativeMetersetWeight is set to the actual total "
+        "(which keeps the plan DICOM-conformant) rather than rescaled, "
+        "because a discrepancy this large indicates a data problem rather "
+        "than floating-point accumulation. Verify the Pinnacle weights.",
+        beam_name,
+        final,
+        _WEIGHT_NORMALISE_TOL,
+    )
+    return weights, final
+
+
+# Pinnacle key spellings that have been seen carrying a per-control-point
+# source-to-surface distance (stored in cm).
+_CP_SSD_KEYS = ("SSD", "Ssd", "SourceToSkinDistance", "SourceToSurfaceDistance")
+
+
+def _cp_ssd_mm(control_point):
+    """Return a control point's SSD in mm, or ``None`` when absent.
+
+    SourceToSurfaceDistance (300A,0130) is a *control point* attribute:
+    on an arc it changes with gantry angle, which is why Pinnacle's own
+    export writes a different value on each control point.  Pinnacle only
+    stores a per-control-point SSD in some versions, so ``None`` here
+    tells the caller to fall back to the beam-level value.
+    """
+    if not isinstance(control_point, dict):
+        return None
+    for key in _CP_SSD_KEYS:
+        raw = control_point.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            ssd_mm = float(raw) * 10  # Pinnacle cm → DICOM mm
+        except (TypeError, ValueError):
+            continue
+        if 100 <= ssd_mm <= 2000:
+            return ssd_mm
+    return None
+
+
+# Candidate Pinnacle machine key spellings for the source-to-device
+# distances reported as SourceToBeamLimitingDeviceDistance (300A,00BA).
+# Values are stored in cm.
+_BLD_DISTANCE_KEYS = {
+    "ASYMX": (
+        "SourceToXJawDistance",
+        "SourceToJawDistanceX",
+        "SourceToLeftRightJawDistance",
+        "XJawDistance",
+    ),
+    "ASYMY": (
+        "SourceToYJawDistance",
+        "SourceToJawDistanceY",
+        "SourceToTopBottomJawDistance",
+        "YJawDistance",
+    ),
+    "MLCX": (
+        "SourceToMLCDistance",
+        "SourceToLeafDistance",
+        "SourceToMultiLeafDistance",
+        "MLCDistance",
+    ),
+}
+
+
+def _bld_distance_mm(machine, device_type):
+    """Source-to-beam-limiting-device distance (mm) from machine data.
+
+    SourceToBeamLimitingDeviceDistance (300A,00BA) is Type 3, so
+    ``None`` is a valid outcome and the attribute is simply omitted —
+    never guessed.  The machine dict and its MultiLeaf sub-dict are both
+    searched because Pinnacle stores the MLC distance alongside the leaf
+    layout in some versions.
+    """
+    if not isinstance(machine, dict):
+        return None
+
+    search_scopes = [machine]
+    multileaf = machine.get("MultiLeaf") or machine.get("MultiLeafLayout")
+    if isinstance(multileaf, dict):
+        search_scopes.append(multileaf)
+
+    for key in _BLD_DISTANCE_KEYS.get(device_type, ()):
+        for scope in search_scopes:
+            raw = scope.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                distance_mm = float(raw) * 10  # Pinnacle cm → DICOM mm
+            except (TypeError, ValueError):
+                continue
+            # A beam limiting device sits between the source and the
+            # isocentre; anything outside this window is a unit or parse
+            # problem rather than real geometry.
+            if 100 <= distance_mm <= 1500:
+                return distance_mm
+    return None
+
+
+def _fraction_group_for_prescription(ds, groups, prescription, plan, beam_name):
+    """Return (creating if needed) the fraction group for *prescription*.
+
+    A Pinnacle trial can mix prescriptions — a 20# phase plus a
+    single-fraction boost, say — and Pinnacle's own export emits one
+    FractionGroupSequence item per prescription.  Collapsing every beam
+    into a single group loses the fractionation of all but one
+    prescription and reports a NumberOfBeams that belongs to no single
+    group, so each distinct prescription gets its own group here.
+    """
+    key = str(prescription.get("Name", "")) if prescription else ""
+    group = groups.get(key)
+    if group is not None:
+        return group
+
+    group = _new_dataset()
+    group.FractionGroupNumber = len(groups) + 1
+    # Type 2: an empty value is valid when the prescription is unknown.
+    group.NumberOfFractionsPlanned = (
+        prescription.get("NumberOfFractions", "") if prescription else ""
+    )
+    group.NumberOfBrachyApplicationSetups = "0"
+    group.ReferencedBeamSequence = _new_sequence()
+    ds.FractionGroupSequence.append(group)
+    groups[key] = group
+
+    plan.logger.debug(
+        "Fraction group %d created for prescription %r (%s fractions), "
+        "first referenced by beam '%s'.",
+        group.FractionGroupNumber,
+        key,
+        group.NumberOfFractionsPlanned,
+        beam_name,
+    )
+    return group
+
+
 def _gantry_direction_between(prev_angle, next_angle):
     """Return the DICOM rotation direction from *prev_angle* to *next_angle*.
 
@@ -429,29 +650,86 @@ def _gantry_direction_between(prev_angle, next_angle):
     return "NONE"
 
 
+def _gantry_directions(cp_data_list, total_cps, beam_flag, beam_name, logger):
+    """Per-control-point GantryRotationDirection for a whole beam.
+
+    DICOM records the direction that carries the gantry *from* each
+    control point to the next, so each entry looks forward and the final
+    control point is always "NONE" -- there is no motion after it.  The
+    previous implementation looked backwards, which left the first
+    control point dependent on the beam-level GantryIsCW / GantryIsCCW
+    flags and wrote a direction on the last control point where Pinnacle
+    writes "NONE".
+
+    *beam_flag* is used only in the degenerate case where every angle is
+    identical yet Pinnacle claims the gantry rotates, which would
+    otherwise silently produce a static beam.
+    """
+    if total_cps <= 0:
+        return []
+
+    last_index = len(cp_data_list) - 1
+    directions = []
+    for j in range(total_cps):
+        if j >= total_cps - 1:
+            directions.append("NONE")
+            continue
+        current = cp_data_list[min(j, last_index)]
+        following = cp_data_list[min(j + 1, last_index)]
+        directions.append(
+            _gantry_direction_between(current["gantry"], following["gantry"])
+        )
+
+    if beam_flag != "NONE" and all(d == "NONE" for d in directions):
+        logger.warning(
+            "Beam '%s': Pinnacle reports the gantry rotates (%s) but every "
+            "control point carries the same angle, so no direction could be "
+            "derived. Using the beam-level flag on the first control point; "
+            "verify the control point data.",
+            beam_name,
+            beam_flag,
+        )
+        directions[0] = beam_flag
+
+    return directions
+
+
 def _parse_mlc_leaf_positions(control_point):
     """Parse MLC leaf positions from a Pinnacle control point dict.
 
-    Returns (leafpositions, p_count) where leafpositions is the interleaved
-    list ready for DICOM and p_count is the total number of raw leaf values.
+    Pinnacle stores the raw points as (left, right) per leaf pair, in cm,
+    in the same order as the machine's ``LeafPairList``.  The machine file
+    names the banks explicitly -- ``LeftBankName`` is ``x2`` and
+    ``RightBankName`` is ``x1`` -- so Pinnacle's left bank is DICOM's +X
+    bank and its right bank is DICOM's -X bank.  This is the same
+    mirroring the jaws undergo, for the same reason: Pinnacle names its
+    collimation in the room frame while DICOM uses IEC beam limiting
+    device coordinates, which are the beam's eye view from the source.
+
+    The previous implementation assigned the banks the other way round
+    *and* reversed each of them.  Both were wrong: verified against a
+    Pinnacle RTPLAN export, X1 is ``-right * 10`` and X2 is
+    ``+left * 10``, each in stored order with no reversal, because
+    ``LeafPairList`` is itself stored in ascending Y order and therefore
+    already lines up with LeafPositionBoundaries.
+
+    Returns (leafpositions, p_count), where leafpositions is the -X bank
+    followed by the +X bank and p_count is the number of raw leaf values.
     """
     points_str = control_point["MLCLeafPositions"]["RawData"]["Points[]"]
     raw_points = points_str.split(",")
     p_count = len(raw_points)
 
-    bank_a = []  # left bank
-    bank_b = []  # right bank
+    bank_x1 = []  # -X bank: Pinnacle's "right" bank
+    bank_x2 = []  # +X bank: Pinnacle's "left" bank
     for i, p in enumerate(raw_points):
         leafpoint = float(p.strip())
         if i % 2 == 0:
-            bank_a.append(-leafpoint * 10)
+            bank_x2.append(leafpoint * 10)
         else:
-            bank_b.append(leafpoint * 10)
+            bank_x1.append(-leafpoint * 10)
 
-    # Reverse both banks and concatenate
-    bank_a = list(reversed(bank_a))
-    bank_b = list(reversed(bank_b))
-    return bank_a + bank_b, p_count
+    return bank_x1 + bank_x2, p_count
 
 
 def _parse_wedge_info(cp_data, plan_logger):
@@ -511,7 +789,7 @@ def _parse_wedge_info(cp_data, plan_logger):
 
 
 def _populate_beam_limiting_device_seq(
-    beam_ds, p_count, logger=None, machine_boundaries=None
+    beam_ds, p_count, logger=None, machine_boundaries=None, machine=None
 ):
     """Populate the BeamLimitingDeviceSequence for a beam.
 
@@ -534,11 +812,13 @@ def _populate_beam_limiting_device_seq(
     asymx = _new_dataset()
     asymx.RTBeamLimitingDeviceType = "ASYMX"
     asymx.NumberOfLeafJawPairs = "1"
+    _set_bld_distance(asymx, machine, "ASYMX", logger)
     beam_ds.BeamLimitingDeviceSequence.append(asymx)
 
     asymy = _new_dataset()
     asymy.RTBeamLimitingDeviceType = "ASYMY"
     asymy.NumberOfLeafJawPairs = "1"
+    _set_bld_distance(asymy, machine, "ASYMY", logger)
     beam_ds.BeamLimitingDeviceSequence.append(asymy)
 
     # NumberOfLeafJawPairs has VR=IS (integer); use integer division so we
@@ -569,7 +849,22 @@ def _populate_beam_limiting_device_seq(
     mlcx.NumberOfLeafJawPairs = num_pairs
     # IS-725: boundaries derived from the Pinnacle machine MultiLeaf data.
     mlcx.LeafPositionBoundaries = machine_boundaries
+    _set_bld_distance(mlcx, machine, "MLCX", logger)
     beam_ds.BeamLimitingDeviceSequence.append(mlcx)
+
+
+def _set_bld_distance(device_ds, machine, device_type, logger):
+    """Set SourceToBeamLimitingDeviceDistance when machine data supplies it."""
+    distance_mm = _bld_distance_mm(machine, device_type)
+    if distance_mm is None:
+        if logger is not None:
+            logger.debug(
+                "%s: no source-to-device distance in the machine data; "
+                "SourceToBeamLimitingDeviceDistance (Type 3) omitted.",
+                device_type,
+            )
+        return
+    device_ds.SourceToBeamLimitingDeviceDistance = _format_ds(distance_mm)
 
 
 def _create_bld_position_entries(x1, x2, y1, y2, leafpositions):
@@ -581,23 +876,40 @@ def _create_bld_position_entries(x1, x2, y1, y2, leafpositions):
     """
     bld_seq = _new_sequence()
 
+    # Formatted through _format_ds rather than handed to pydicom as raw
+    # floats: the cm -> mm multiplication leaves binary-float noise that
+    # pydicom renders in full (e.g. "-12.668299999999" for -12.6683),
+    # which wastes DS characters and makes diffs against Pinnacle's own
+    # export unreadable.
     asymx = _new_dataset()
     asymx.RTBeamLimitingDeviceType = "ASYMX"
-    asymx.LeafJawPositions = [x1, x2]
+    asymx.LeafJawPositions = [_format_ds(x1), _format_ds(x2)]
     bld_seq.append(asymx)
 
     asymy = _new_dataset()
     asymy.RTBeamLimitingDeviceType = "ASYMY"
-    asymy.LeafJawPositions = [y1, y2]
+    asymy.LeafJawPositions = [_format_ds(y1), _format_ds(y2)]
     bld_seq.append(asymy)
 
     if leafpositions:
         mlcx = _new_dataset()
         mlcx.RTBeamLimitingDeviceType = "MLCX"
-        mlcx.LeafJawPositions = leafpositions
+        mlcx.LeafJawPositions = [_format_ds(v) for v in leafpositions]
         bld_seq.append(mlcx)
 
     return bld_seq
+
+
+def _set_cp_ssd(cp, cp_entry):
+    """Write SourceToSurfaceDistance on a non-first control point.
+
+    Only written when Pinnacle supplies a per-control-point value: on a
+    subsequent control point, repeating the beam-level SSD would assert
+    that the distance is unchanged, which is not true on an arc.
+    """
+    ssd_mm = cp_entry.get("ssd")
+    if ssd_mm is not None:
+        cp.SourceToSurfaceDistance = _format_ds(ssd_mm)
 
 
 def _create_wedge_position_seq():
@@ -677,7 +989,17 @@ def _populate_first_control_point(
     cp.IsocenterPosition = iso_center
 
     # --- Source to Surface Distance (Type 3) ---
-    cp.SourceToSurfaceDistance = beam["SSD"] * 10
+    # This is a control point attribute, not a beam attribute: on an arc it
+    # tracks the gantry angle.  Use the control point's own value when
+    # Pinnacle stores one, otherwise the beam-level SSD.
+    ssd_mm = cp_entry.get("ssd")
+    if ssd_mm is None:
+        try:
+            ssd_mm = float(beam["SSD"]) * 10
+        except (KeyError, TypeError, ValueError):
+            ssd_mm = None
+    if ssd_mm is not None:
+        cp.SourceToSurfaceDistance = _format_ds(ssd_mm)
 
     # --- Wedge position (1C — required when wedges present) ---
     if numwedges > 0:
@@ -858,17 +1180,17 @@ def convert_plan_for_trial(
     # with reviewer/timestamp audit fields, unlocked → UNAPPROVED).
     apply_approval_status(ds, plan)
 
-    # --- Fraction Group ---
+    # --- Fraction Groups ---
+    # One FractionGroupSequence item per distinct prescription referenced by
+    # the trial's beams, matching Pinnacle's own export.  Groups are created
+    # lazily as beams resolve their prescription.
     ds.FractionGroupSequence = _new_sequence()
-    fraction_group = _new_dataset()
-    fraction_group.ReferencedBeamSequence = _new_sequence()
-    ds.FractionGroupSequence.append(fraction_group)
+    fraction_groups = {}
 
     # --- Sequences that are populated per-beam ---
     ds.BeamSequence = _new_sequence()
     ds.PatientSetupSequence = _new_sequence()
 
-    num_fractions = 0
     beam_count = 0
 
     beam_list = trial_info["BeamList"] if trial_info["BeamList"] else []
@@ -893,10 +1215,11 @@ def convert_plan_for_trial(
         patient_setup.PatientSetupNumber = beam_count
         ds.PatientSetupSequence.append(patient_setup)
 
-        # --- Referenced Beam in Fraction Group ---
+        # --- Referenced Beam ---
+        # Appended to its prescription's fraction group further down, once
+        # the beam's prescription has been resolved.
         ref_beam = _new_dataset()
         ref_beam.ReferencedBeamNumber = beam_count
-        fraction_group.ReferencedBeamSequence.append(ref_beam)
 
         # --- Beam dataset ---
         beam_ds = _new_dataset()
@@ -985,17 +1308,29 @@ def convert_plan_for_trial(
 
             leafpositions, p_count = _parse_mlc_leaf_positions(cp_data)
 
+            # Pinnacle names its jaws in the room/patient frame; DICOM
+            # BeamLimitingDevicePositionSequence uses IEC beam limiting
+            # device coordinates, which are the beam's eye view *from the
+            # source* and therefore mirrored relative to Pinnacle on both
+            # axes.  X1 is the -X jaw and X2 the +X jaw, so X1 comes from
+            # RightJawPosition and X2 from LeftJawPosition; likewise Y1
+            # from TopJawPosition and Y2 from BottomJawPosition.  The
+            # previous mapping produced jaw pairs whose magnitudes were
+            # swapped relative to Pinnacle's own RTPLAN export (e.g.
+            # -45\55 where Pinnacle wrote -55\45), which silently
+            # mirrors every asymmetric field.
             cp_data_list.append(
                 {
-                    "x1": -cp_data["LeftJawPosition"] * 10,
-                    "x2": cp_data["RightJawPosition"] * 10,
-                    "y1": -cp_data["BottomJawPosition"] * 10,
-                    "y2": cp_data["TopJawPosition"] * 10,
+                    "x1": -cp_data["RightJawPosition"] * 10,
+                    "x2": cp_data["LeftJawPosition"] * 10,
+                    "y1": -cp_data["TopJawPosition"] * 10,
+                    "y2": cp_data["BottomJawPosition"] * 10,
                     "leafpositions": leafpositions,
                     "p_count": p_count,
                     "gantry": cp_data["Gantry"],
                     "collimator": cp_data["Collimator"],
                     "couch": cp_data["Couch"],
+                    "ssd": _cp_ssd_mm(cp_data),
                 }
             )
 
@@ -1017,11 +1352,29 @@ def convert_plan_for_trial(
         numwedges = wedge_info["count"] if wedge_info else 0
 
         # --- Prescription and energy ---
-        prescription = [
+        # A missing prescription used to raise IndexError and abort the whole
+        # export; the beam is still exported, in its own fraction group with
+        # an empty (Type 2) NumberOfFractionsPlanned.
+        matching = [
             p
-            for p in trial_info["PrescriptionList"]
-            if p["Name"] == beam["PrescriptionName"]
-        ][0]
+            for p in (trial_info.get("PrescriptionList") or [])
+            if p.get("Name") == beam.get("PrescriptionName")
+        ]
+        prescription = matching[0] if matching else None
+        if prescription is None:
+            plan.logger.warning(
+                "Beam '%s': prescription %r not found in the trial's "
+                "PrescriptionList (available: %s); NumberOfFractionsPlanned "
+                "will be left empty for its fraction group.",
+                beam.get("Name"),
+                beam.get("PrescriptionName"),
+                [p.get("Name") for p in (trial_info.get("PrescriptionList") or [])],
+            )
+
+        fraction_group = _fraction_group_for_prescription(
+            ds, fraction_groups, prescription, plan, beam.get("Name")
+        )
+        fraction_group.ReferencedBeamSequence.append(ref_beam)
 
         mnv = beam["MachineNameAndVersion"]
         if ": " in mnv:
@@ -1071,6 +1424,14 @@ def convert_plan_for_trial(
                 beam["Name"],
             )
 
+        # Pinnacle can store leaf coordinates with the sign convention
+        # inverted.  The bank mapping below was verified only against
+        # machines with this flag clear, and honouring it incorrectly would
+        # mirror every leaf pair, so an export that would depend on it is
+        # refused rather than guessed -- the same stance taken for the
+        # leaf boundary table.
+        _reject_negated_leaf_coordinates(machine, beam["Name"])
+
         # MLC LeafPositionBoundaries from the machine MultiLeaf layout.
         machine_boundaries = _leaf_boundaries_from_machine(
             machine, p_count // 2, plan.logger
@@ -1111,7 +1472,11 @@ def convert_plan_for_trial(
         normdose = beam["MonitorUnitInfo"]["NormalizedDose"]
 
         if normdose == 0:
-            ref_beam.BeamMeterset = 0
+            # A zero-dose beam (a setup/verification field) still carries an
+            # explicit zero in Pinnacle's own export; BeamDose was previously
+            # left unset here while BeamMeterset was written.
+            ref_beam.BeamDose = _format_ds(0)
+            ref_beam.BeamMeterset = _format_ds(0)
         elif dose_per_mu_at_cal <= 0:
             # No valid calibration was located (machine/energy mismatch, or a
             # non-positive value). Computing prescripdose / (normdose *
@@ -1128,8 +1493,13 @@ def convert_plan_for_trial(
                 machineenergyname,
             )
         else:
-            ref_beam.BeamDose = prescripdose / 100
-            ref_beam.BeamMeterset = prescripdose / (normdose * dose_per_mu_at_cal)
+            # Formatted rather than assigned as raw floats: the division
+            # leaves noise that pydicom renders in full, which can run a
+            # DS value up against its 16-character limit.
+            ref_beam.BeamDose = _format_ds(prescripdose / 100)
+            ref_beam.BeamMeterset = _format_ds(
+                prescripdose / (normdose * dose_per_mu_at_cal)
+            )
 
         # Gantry rotation direction
         is_ccw = cp_manager.get("GantryIsCCW") == 1
@@ -1174,6 +1544,7 @@ def convert_plan_for_trial(
                 p_count,
                 machine_boundaries,
                 beam_iso_center,
+                machine,
             )
         else:
             _build_non_ss_control_points(
@@ -1191,16 +1562,21 @@ def convert_plan_for_trial(
                 p_count,
                 machine_boundaries,
                 beam_iso_center,
+                machine,
             )
 
-        num_fractions = prescription["NumberOfFractions"]
         numwedges = 0  # Reset for next beam
 
-    # --- Fraction Group summary ---
-    fraction_group.FractionGroupNumber = 1
-    fraction_group.NumberOfFractionsPlanned = num_fractions
-    fraction_group.NumberOfBeams = beam_count
-    fraction_group.NumberOfBrachyApplicationSetups = "0"
+    # --- Fraction group summaries ---
+    # NumberOfBeams is per group, not the trial-wide beam count.
+    for group in ds.FractionGroupSequence:
+        group.NumberOfBeams = len(group.ReferencedBeamSequence)
+    plan.logger.debug(
+        "Trial '%s': %d beam(s) across %d fraction group(s).",
+        trial_info.get("Name"),
+        beam_count,
+        len(ds.FractionGroupSequence),
+    )
 
     # --- Save ---
     output_file = os.path.join(export_path, rp_filename)
@@ -1228,6 +1604,7 @@ def _build_step_and_shoot_control_points(
     p_count,
     machine_boundaries,
     iso_center,
+    machine=None,
 ):
     """Build control points for a Step & Shoot beam.
 
@@ -1244,7 +1621,8 @@ def _build_step_and_shoot_control_points(
 
     total_cps = numctrlpts * 2
     beam_ds.NumberOfControlPoints = total_cps
-    beam_ds.SourceToSurfaceDistance = beam["SSD"] * 10
+    # SourceToSurfaceDistance (300A,0130) is defined on the Control Point
+    # Sequence, not on the beam, so it is written per control point below.
 
     if numwedges > 0:
         beam_ds.WedgeSequence = _create_wedge_sequence(wedge_info)
@@ -1270,17 +1648,10 @@ def _build_step_and_shoot_control_points(
             metercount += 1
         cumulative_weights.append(currentmeterset)
 
-    final_weight = cumulative_weights[-1] if cumulative_weights else 0.0
+    cumulative_weights, final_weight = _normalise_cumulative_weights(
+        cumulative_weights, beam["Name"], plan.logger
+    )
     beam_ds.FinalCumulativeMetersetWeight = _format_ds(final_weight)
-    if abs(final_weight - 1.0) > 1e-3:
-        plan.logger.warning(
-            "Beam '%s': cumulative meterset weights sum to %s (expected "
-            "~1.0). FinalCumulativeMetersetWeight is set to the actual "
-            "total, which keeps the plan DICOM-conformant, but verify the "
-            "Pinnacle weights.",
-            beam["Name"],
-            final_weight,
-        )
 
     # --- Pass 2: build the control points ---
     for j in range(total_cps):
@@ -1288,17 +1659,7 @@ def _build_step_and_shoot_control_points(
         beam_ds.ControlPointSequence.append(cp)
 
         cp.ControlPointIndex = j
-        cp.ReferencedDoseReferenceSequence = _new_sequence()
-
-        dose_ref = _new_dataset()
-        cp.ReferencedDoseReferenceSequence.append(dose_ref)
-
-        cmw = cumulative_weights[j]
-        cp.CumulativeMetersetWeight = _format_ds(cmw)
-        # Coefficient is the delivered fraction: CMW / FCMW.
-        coefficient = cmw / final_weight if final_weight else 0.0
-        dose_ref.CumulativeDoseReferenceCoefficient = _format_ds(coefficient)
-        dose_ref.ReferencedDoseReferenceNumber = "1"
+        cp.CumulativeMetersetWeight = _format_ds(cumulative_weights[j])
 
         # DICOM CP j belongs to Pinnacle segment j // 2.
         cp_entry = cp_data_list[min(j // 2, len(cp_data_list) - 1)]
@@ -1327,10 +1688,11 @@ def _build_step_and_shoot_control_points(
                 cp_entry["y2"],
                 cp_entry["leafpositions"],
             )
+            _set_cp_ssd(cp, cp_entry)
 
     # Beam Limiting Device Sequence (beam level)
     _populate_beam_limiting_device_seq(
-        beam_ds, p_count, plan.logger, machine_boundaries
+        beam_ds, p_count, plan.logger, machine_boundaries, machine
     )
 
 
@@ -1354,6 +1716,7 @@ def _build_non_ss_control_points(
     p_count,
     machine_boundaries,
     iso_center,
+    machine=None,
 ):
     """Build control points for a non-Step-and-Shoot beam (e.g. conformal arc).
 
@@ -1370,9 +1733,34 @@ def _build_non_ss_control_points(
     """
     plan.logger.debug("Not using Step & Shoot")
 
-    total_cps = numctrlpts + 1
+    # Pinnacle's per-control-point Weight is the fraction of the beam's
+    # meterset delivered in the segment *starting* at that point, so N
+    # Pinnacle points normally describe N segments and need N+1 DICOM
+    # control points -- a static beam stores one point of weight 1 and
+    # Pinnacle's own export writes two.  An arc, however, stores a final
+    # point of weight zero which is already the terminating point: adding
+    # another duplicates the last aperture at an unchanged cumulative
+    # weight and inflates NumberOfControlPoints by one (76 -> 77).
+    trailing_zero_weight = False
+    if len(metersetweight) > 2:
+        try:
+            trailing_zero_weight = float(metersetweight[-1]) == 0.0
+        except (TypeError, ValueError):
+            trailing_zero_weight = False
+
+
+    total_cps = numctrlpts if trailing_zero_weight else numctrlpts + 1
     beam_ds.NumberOfControlPoints = total_cps
-    beam_ds.SourceToSurfaceDistance = beam["SSD"] * 10
+    plan.logger.debug(
+        "Beam '%s': %d Pinnacle control point(s) -> %d DICOM control "
+        "point(s) (the final Pinnacle weight is %szero).",
+        beam["Name"],
+        numctrlpts,
+        total_cps,
+        "" if trailing_zero_weight else "non-",
+    )
+    # SourceToSurfaceDistance (300A,0130) is defined on the Control Point
+    # Sequence, not on the beam, so it is written per control point below.
 
     if numwedges > 0:
         beam_ds.WedgeSequence = _create_wedge_sequence(wedge_info)
@@ -1385,33 +1773,21 @@ def _build_non_ss_control_points(
             running += float(metersetweight[j])
         cumulative_weights.append(running)
 
-    final_weight = cumulative_weights[-1] if cumulative_weights else 0.0
+    cumulative_weights, final_weight = _normalise_cumulative_weights(
+        cumulative_weights, beam["Name"], plan.logger
+    )
     beam_ds.FinalCumulativeMetersetWeight = _format_ds(final_weight)
-    if abs(final_weight - 1.0) > 1e-3:
-        plan.logger.warning(
-            "Beam '%s': final cumulative meterset weight is %s (expected "
-            "~1.0). FinalCumulativeMetersetWeight is set to the actual "
-            "value, which keeps the plan DICOM-conformant, but verify the "
-            "Pinnacle weights.",
-            beam["Name"],
-            final_weight,
-        )
+
+    gantry_directions = _gantry_directions(
+        cp_data_list, total_cps, gantryrotdir, beam["Name"], plan.logger
+    )
 
     for j in range(total_cps):
         cp = _new_dataset()
         beam_ds.ControlPointSequence.append(cp)
 
         cp.ControlPointIndex = j
-        cp.ReferencedDoseReferenceSequence = _new_sequence()
-
-        dose_ref = _new_dataset()
-        cp.ReferencedDoseReferenceSequence.append(dose_ref)
-
-        cmw = cumulative_weights[j]
-        cp.CumulativeMetersetWeight = _format_ds(cmw)
-        coefficient = cmw / final_weight if final_weight else 0.0
-        dose_ref.CumulativeDoseReferenceCoefficient = _format_ds(coefficient)
-        dose_ref.ReferencedDoseReferenceNumber = "1"
+        cp.CumulativeMetersetWeight = _format_ds(cumulative_weights[j])
 
         # appended final CP repeats the last Pinnacle aperture.
         pinn_idx = min(j, len(cp_data_list) - 1)
@@ -1426,7 +1802,7 @@ def _build_non_ss_control_points(
                 plan,
                 beam_energy,
                 doserate,
-                gantryrotdir,
+                gantry_directions[0],
                 numwedges,
                 cp_entry,
                 iso_center,
@@ -1444,13 +1820,11 @@ def _build_non_ss_control_points(
 
             # per-control-point gantry angle and rotation
             # direction so direction reversals mid-delivery are captured.
-            prev_entry = cp_data_list[min(j - 1, len(cp_data_list) - 1)]
             cp.GantryAngle = cp_entry["gantry"]
-            cp.GantryRotationDirection = _gantry_direction_between(
-                prev_entry["gantry"], cp_entry["gantry"]
-            )
+            cp.GantryRotationDirection = gantry_directions[j]
+            _set_cp_ssd(cp, cp_entry)
 
     # Beam Limiting Device Sequence (beam level)
     _populate_beam_limiting_device_seq(
-        beam_ds, p_count, plan.logger, machine_boundaries
+        beam_ds, p_count, plan.logger, machine_boundaries, machine
     )
