@@ -198,7 +198,9 @@ def _safe_load_reporting_duplicates(yaml_text, filename, segment):
         logger.warning(
             "'%s' (segment %d): %d duplicate key(s) were overwritten while "
             "parsing — data from earlier objects has been LOST. Keys: %s%s",
-            filename, segment, len(duplicates),
+            filename,
+            segment,
+            len(duplicates),
             ", ".join(repr(k) for k in unique[:10]),
             " …" if len(unique) > 10 else "",
         )
@@ -235,12 +237,12 @@ def pinn_to_dict(filename):
         first_line = data[0]
         if _NUMBERED_OBJECT_HEADER.match(first_line):
             indices = [
-                i for i, line in enumerate(data)
-                if _NUMBERED_OBJECT_HEADER.match(line)
+                i for i, line in enumerate(data) if _NUMBERED_OBJECT_HEADER.match(line)
             ]
             logger.debug(
                 "'%s' uses numbered object headers; split into %d object(s).",
-                filename, len(indices),
+                filename,
+                len(indices),
             )
         else:
             indices = [i for i, line in enumerate(data) if line == first_line]
