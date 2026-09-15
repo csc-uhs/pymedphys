@@ -103,7 +103,7 @@ jsonschema==4.26.0
     #   nbformat
 jsonschema-specifications==2025.9.1
     # via jsonschema
-jupyter-book==1.0.4.post1
+jupyter-book==2.1.6
     # via pymedphys
 jupyter-cache==1.0.1
     # via myst-nb
