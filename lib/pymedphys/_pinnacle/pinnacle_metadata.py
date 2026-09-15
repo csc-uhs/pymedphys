@@ -565,18 +565,18 @@ def apply_equipment_stamps(
 # so the relationship stays readable at a glance.
 UID_MODALITY_INDEX = {
     # SOP Instance UIDs
-    "ct":     "1",  # CT SOP Instance UID (per slice)
+    "ct": "1",  # CT SOP Instance UID (per slice)
     "struct": "2",  # RTSTRUCT
-    "plan":   "3",  # RTPLAN
-    "dose":   "4",  # RTDOSE
+    "plan": "3",  # RTPLAN
+    "dose": "4",  # RTDOSE
     # Study / Frame of Reference (shared across objects)
-    "study":  "5",  # StudyInstanceUID
-    "frame":  "6",  # FrameOfReferenceUID
+    "study": "5",  # StudyInstanceUID
+    "frame": "6",  # FrameOfReferenceUID
     # Series Instance UIDs (instance index + 10)
-    "series_ct":     "11",
+    "series_ct": "11",
     "series_struct": "12",
-    "series_plan":   "13",
-    "series_dose":   "14",
+    "series_plan": "13",
+    "series_dose": "14",
 }
 
 
