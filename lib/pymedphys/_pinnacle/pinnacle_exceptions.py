@@ -79,3 +79,15 @@ class MachineDataNotFoundError(Exception):
     # silently shifts every leaf pair — so the trial's RTPLAN export is
     # failed instead.
     pass
+
+
+class UnsupportedWedgeError(Exception):
+    # Raised when a beam uses a wedge this exporter cannot convert
+    # correctly.  The motorized wedge is supported, having been validated
+    # against a Pinnacle RTPLAN export.  Other wedge types, lateral wedge
+    # orientations, an undeterminable wedge angle, and machines whose
+    # output factor table has no entry for the wedge in use are all
+    # refused: each would produce a plan that looks complete while
+    # misdescribing the wedge or its monitor units, which no inspection
+    # of the converted plan would reveal.
+    pass

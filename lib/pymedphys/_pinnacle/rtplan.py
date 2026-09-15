@@ -48,6 +48,7 @@ from pymedphys._pinnacle.pinnacle_exceptions import (
     MachineDataNotFoundError,
     MissingCTImageError,
     MissingTrialBeamsError,
+    UnsupportedWedgeError,
 )
 
 from .constants import (
@@ -410,37 +411,188 @@ _METERSET_REL_TOL = 0.002
 _METERSET_ABS_TOL = 0.1
 
 
-def _collimator_output_factor(beam, logger):
-    """Field-size output factor for the beam's meterset denominator.
+def _equivalent_square(mu_info):
+    """Field's equivalent square at SAD, in cm, as 4 x area / perimeter.
 
-    Returns 1.0 (a no-op) when Pinnacle has no usable value, so a missing
-    factor leaves the previous behaviour rather than producing a zero or
-    negative meterset.
+    This is the quantity Pinnacle indexes its output factor table on --
+    its MU panel labels the lookup "4A/P" -- so the same reduction has to
+    be used here for the interpolated factor to match.
     """
+    try:
+        area = float(mu_info.get("UnblockedFieldAreaAtSAD"))
+        perimeter = float(mu_info.get("UnblockedFieldPerimeterAtSAD"))
+    except (TypeError, ValueError):
+        return None
+    if perimeter <= 0 or area <= 0:
+        return None
+    return 4 * area / perimeter
+
+
+def _normalise_wedge_name(name):
+    return str(name or "").strip().casefold()
+
+
+def _output_factor_table(machine, energy_name, wedge_name):
+    """Collimator output factors for one wedge state, by equivalent square.
+
+    Pinnacle stores a single MeasureGeometryList per photon energy
+    holding the measured geometries for every wedge state, each tagged
+    with its own WedgeContext.  The collimator output factor for an entry
+    is MeasuredOutputFactor / PhantomOutputFactor: applying that to the
+    open entries reproduces the CollimatorOutputFactor Pinnacle stores in
+    MonitorUnitInfo exactly, which is what establishes the method.
+
+    Returns a list of ``(equivalent_square, factor)`` sorted by field
+    size, or an empty list when no entry matches.
+    """
+    wanted = _normalise_wedge_name(wedge_name)
+    table = []
+
+    for energy in ((machine or {}).get("PhotonEnergyList") or []):
+        if not isinstance(energy, dict) or energy.get("Name") != energy_name:
+            continue
+        geometries = (
+            ((energy.get("PhysicsData") or {}).get("OutputFactor") or {})
+            .get("MeasureGeometryList")
+        ) or []
+        if isinstance(geometries, dict):
+            geometries = list(geometries.values())
+
+        for entry in geometries:
+            if not isinstance(entry, dict):
+                continue
+            context = entry.get("WedgeContext") or {}
+            if _normalise_wedge_name(context.get("WedgeName")) != wanted:
+                continue
+            try:
+                width = (float(entry["LeftJawPosition"])
+                         + float(entry["RightJawPosition"]))
+                height = (float(entry["TopJawPosition"])
+                          + float(entry["BottomJawPosition"]))
+                measured = float(entry["MeasuredOutputFactor"])
+                phantom = float(entry["PhantomOutputFactor"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if min(width, height, phantom) <= 0:
+                continue
+            equivalent_square = 4 * (width * height) / (2 * (width + height))
+            table.append((equivalent_square, measured / phantom))
+
+    return sorted(table)
+
+
+def _interpolate_output_factor(table, equivalent_square):
+    """Linear interpolation in equivalent square, clamped at both ends."""
+    if not table:
+        return None
+    if equivalent_square <= table[0][0]:
+        return table[0][1]
+    if equivalent_square >= table[-1][0]:
+        return table[-1][1]
+    for (x0, y0), (x1, y1) in zip(table, table[1:]):
+        if x0 <= equivalent_square <= x1:
+            if x1 == x0:
+                return y0
+            return y0 + (y1 - y0) * (equivalent_square - x0) / (x1 - x0)
+    return table[-1][1]
+
+
+def _stored_collimator_output_factor(beam):
     raw = (beam.get("MonitorUnitInfo") or {}).get("CollimatorOutputFactor")
     try:
         factor = float(raw)
     except (TypeError, ValueError):
-        factor = None
+        return None
+    return factor if factor > 0 else None
 
-    if not factor or factor <= 0:
-        logger.warning(
-            "Beam '%s': no usable CollimatorOutputFactor in MonitorUnitInfo "
-            "(found %r). BeamMeterset is computed without it, which will "
-            "under- or over-state the monitor units by the amount this "
-            "field's output departs from the calibration geometry. Verify "
-            "the meterset before clinical use.",
-            beam.get("Name"),
-            raw,
+
+def _collimator_output_factor(beam, machine, wedge_name, logger):
+    """Collimator output factor for the beam's meterset denominator.
+
+    For an unwedged beam Pinnacle's stored CollimatorOutputFactor is
+    authoritative and is used directly; the table lookup runs anyway as a
+    cross-check, because a disagreement means the lookup is wrong and
+    that matters for the wedged case where there is nothing to check
+    against.
+
+    For a wedged beam the stored value is the *open field* factor --
+    Pinnacle displays and stores it even though its own meterset
+    calculation uses the wedged one -- so the table is the only correct
+    source.  Verified against a Pinnacle RTPLAN export: using the stored
+    value leaves the meterset about 11% low.
+    """
+    stored = _stored_collimator_output_factor(beam)
+    wedged = _normalise_wedge_name(wedge_name) not in _NO_WEDGE_KEYS
+
+    equivalent_square = _equivalent_square(beam.get("MonitorUnitInfo") or {})
+    table = _output_factor_table(
+        machine, beam.get("MachineEnergyName"), wedge_name
+    )
+    looked_up = (
+        _interpolate_output_factor(table, equivalent_square)
+        if equivalent_square is not None
+        else None
+    )
+
+    if not wedged:
+        if stored is None:
+            return _fallback_output_factor(beam, looked_up, logger)
+        if looked_up is not None and abs(looked_up - stored) > 1e-3 * stored:
+            logger.warning(
+                "Beam '%s': output factor interpolated from the machine "
+                "table is %s but Pinnacle stored %s for the same open "
+                "field. The stored value is used, but the disagreement "
+                "means the table lookup cannot be trusted for wedged "
+                "beams on this machine.",
+                beam.get("Name"),
+                looked_up,
+                stored,
+            )
+        return _check_output_factor_range(beam, stored, logger)
+
+    if looked_up is None:
+        raise UnsupportedWedgeError(
+            f"Beam '{beam.get('Name')}': no output factor table entry for "
+            f"wedge {wedge_name!r} at energy "
+            f"{beam.get('MachineEnergyName')!r} in the machine data, so its "
+            f"monitor units cannot be calculated. Pinnacle's stored "
+            f"CollimatorOutputFactor is the open-field value and using it "
+            f"would leave the meterset roughly 11% low."
         )
-        return 1.0
 
+    logger.debug(
+        "Beam '%s': wedge %s, equivalent square %.3f cm, output factor %.6f "
+        "(open-field stored value was %s).",
+        beam.get("Name"),
+        wedge_name,
+        equivalent_square,
+        looked_up,
+        stored,
+    )
+    return _check_output_factor_range(beam, looked_up, logger)
+
+
+def _fallback_output_factor(beam, looked_up, logger):
+    if looked_up is not None:
+        return looked_up
+    logger.warning(
+        "Beam '%s': no CollimatorOutputFactor in MonitorUnitInfo and no "
+        "usable machine output factor table. BeamMeterset is computed "
+        "without it, which will mis-state the monitor units by the amount "
+        "this field's output departs from the calibration geometry. Verify "
+        "the meterset before clinical use.",
+        beam.get("Name"),
+    )
+    return 1.0
+
+
+def _check_output_factor_range(beam, factor, logger):
     low, high = _PLAUSIBLE_OUTPUT_FACTOR
     if not low <= factor <= high:
         logger.warning(
-            "Beam '%s': CollimatorOutputFactor is %s, outside the plausible "
-            "range %s-%s. It is still applied, but check the machine data: "
-            "this value scales BeamMeterset directly.",
+            "Beam '%s': output factor is %s, outside the plausible range "
+            "%s-%s. It is still applied, but check the machine data: this "
+            "value scales BeamMeterset directly.",
             beam.get("Name"),
             factor,
             low,
@@ -449,35 +601,30 @@ def _collimator_output_factor(beam, logger):
     return factor
 
 
-def _warn_on_unmodelled_transmission(beam, logger):
-    """Flag beams whose meterset depends on a transmission we do not apply.
+def _total_transmission_fraction(beam, logger):
+    """Tray, block and wedge transmission from Pinnacle's MU equation.
 
-    TotalTransmissionFraction covers trays, blocks and wedges.  Every plan
-    this exporter has been validated against had it at 1.0, so where it
-    enters Pinnacle's meterset chain is unverified and applying it would
-    be a guess.  A beam that actually carries a transmission is therefore
-    reported rather than silently converted.
+    Pinnacle states its own calculation as
+    ``Dose = MU x ND x OFc x TTF x (D/MU)cal``, so this belongs in the
+    denominator.  It was previously only warned about, which left any
+    plan carrying a tray or block wrong by exactly the tray factor.
     """
     raw = (beam.get("MonitorUnitInfo") or {}).get("TotalTransmissionFraction")
     try:
         transmission = float(raw)
     except (TypeError, ValueError):
-        return
+        return 1.0
 
-    if abs(transmission - 1.0) <= 1e-9:
-        return
-
-    logger.warning(
-        "Beam '%s': TotalTransmissionFraction is %s, not 1.0 (a tray, block "
-        "or wedge is in the beam). This exporter's meterset calculation does "
-        "not apply it, because no validated plan was available to confirm "
-        "where it enters Pinnacle's calculation. BeamMeterset may be wrong "
-        "by roughly %.2f%% for this beam -- check it against Pinnacle before "
-        "clinical use.",
-        beam.get("Name"),
-        transmission,
-        abs(1.0 - transmission) * 100,
-    )
+    if transmission <= 0:
+        logger.warning(
+            "Beam '%s': TotalTransmissionFraction is %r; ignoring it rather "
+            "than producing a zero or negative meterset. Verify the "
+            "meterset before clinical use.",
+            beam.get("Name"),
+            raw,
+        )
+        return 1.0
+    return transmission
 
 
 def _verify_metersets(checks, logger):
@@ -871,59 +1018,212 @@ def _parse_mlc_leaf_positions(control_point):
     return bank_x1 + bank_x2, p_count
 
 
-def _parse_wedge_info(cp_data, plan_logger):
-    """Parse wedge information from a Pinnacle control point.
+# Pinnacle names an absent wedge with one of these.
+_NO_WEDGE_NAMES = ("", "No Wedge", "NoWedge", "None")
+_NO_WEDGE_KEYS = frozenset(n.strip().casefold() for n in _NO_WEDGE_NAMES)
 
-    Returns a dict with wedge details, or None if no wedge is present.
-    Keys: type, angle, name, orientation, count.
+
+def _wedge_names_in_beam(control_points):
+    """Distinct wedge names across a beam's control points, in order."""
+    names = []
+    for cp in control_points or []:
+        if not isinstance(cp, dict):
+            continue
+        name = ((cp.get("WedgeContext") or {}).get("WedgeName") or "")
+        name = str(name).strip()
+        if name in _NO_WEDGE_NAMES:
+            continue
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _cp_wedge_position(cp_entry, beam_wedge_name):
+    """"IN" when this control point's segment carries the beam's wedge."""
+    return (
+        "IN"
+        if _normalise_wedge_name(cp_entry.get("wedge"))
+        == _normalise_wedge_name(beam_wedge_name)
+        else "OUT"
+    )
+
+
+def _dicom_beam_type(set_beam_type):
+    """DICOM BeamType for a Pinnacle SetBeamType.
+
+    A motorized wedge beam delivers a wedged segment then an open one
+    with nothing moving during either, which is STATIC -- as Pinnacle's
+    own RTPLAN export writes it.
     """
-    wedge_context = cp_data["WedgeContext"]
-    wedge_name_raw = wedge_context["WedgeName"]
+    upper = str(set_beam_type or "").upper()
+    if "STATIC" in upper or "MOTORIZED" in upper:
+        return "STATIC"
+    return "DYNAMIC"
 
-    if wedge_name_raw in ("No Wedge", ""):
-        plan_logger.debug("No wedge present")
+
+def _uses_segment_control_points(set_beam_type):
+    """True when each Pinnacle control point is a segment, not a waypoint.
+
+    Step & shoot and motorized wedge beams both deliver discrete
+    segments, and DICOM describes a segment with a pair of control points
+    marking its start and end -- which is why Pinnacle's export of a
+    two-segment motorized wedge beam has four control points.
+    """
+    upper = str(set_beam_type or "").upper()
+    if "MOTORIZED" in upper:
+        return True
+    return "STEP" in upper and "SHOOT" in upper
+
+
+def _wedge_control_point(control_points, wedge_name):
+    """The first control point that carries *wedge_name*.
+
+    The wedge is not necessarily on the first control point, and its
+    context is what the WedgeSequence is built from.
+    """
+    wanted = _normalise_wedge_name(wedge_name)
+    for cp in control_points or []:
+        if isinstance(cp, dict) and _normalise_wedge_name(
+            (cp.get("WedgeContext") or {}).get("WedgeName")
+        ) == wanted:
+            return cp
+    return (control_points or [{}])[0]
+
+
+def _beam_wedge_name(control_points):
+    """The wedge a beam uses, or "No Wedge" when it has none."""
+    names = _wedge_names_in_beam(control_points)
+    return names[0] if names else "No Wedge"
+
+
+# Wedge orientations this exporter can convert.  WedgeTopToBottom -> 0 is
+# read off a Pinnacle RTPLAN export; WedgeBottomToTop is then forced to be
+# its opposite.  The lateral orientations map to 90 and 270, but which way
+# round is not determined by anything available here, and a mirrored wedge
+# gradient is not visible in the converted plan, so they are refused
+# instead of guessed.
+# A beam carries at most one wedge, so a single number suffices; the
+# per-control-point ReferencedWedgeNumber must match it.
+_WEDGE_NUMBER = 1
+
+_WEDGE_ORIENTATIONS = {
+    "wedgetoptobottom": "0",
+    "wedgebottomtotop": "180",
+}
+
+
+def _machine_wedge_entry(machine, wedge_name):
+    """The machine's WedgeList entry for *wedge_name*, if present."""
+    wanted = _normalise_wedge_name(wedge_name)
+    entries = (machine or {}).get("WedgeList")
+    if isinstance(entries, dict):
+        entries = list(entries.values())
+    for entry in entries or []:
+        if isinstance(entry, dict) and (
+            _normalise_wedge_name(entry.get("Name")) == wanted
+        ):
+            return entry
+    return None
+
+
+def _wedge_angle(wedge_name, machine_entry, beam_name, logger):
+    """Nominal wedge angle in degrees.
+
+    Pinnacle stores the angle on the machine's wedge entry;
+    ``WedgeContext.Angle`` is the string "Fixed" for a motorized wedge and
+    so cannot be used.  The digits in the wedge's name (W60 -> 60) are a
+    fallback.
+    """
+    raw = (machine_entry or {}).get("NominalAngle")
+    try:
+        return str(int(float(raw)))
+    except (TypeError, ValueError):
+        pass
+
+    digits = re.findall(r"\d+", str(wedge_name or ""))
+    if digits:
+        logger.debug(
+            "Beam '%s': wedge angle taken from the wedge name %r; the "
+            "machine's WedgeList has no usable NominalAngle.",
+            beam_name,
+            wedge_name,
+        )
+        return digits[0]
+
+    raise UnsupportedWedgeError(
+        f"Beam '{beam_name}': the wedge angle for {wedge_name!r} could not "
+        f"be determined from the machine's WedgeList (NominalAngle) or from "
+        f"the wedge name. WedgeAngle is Type 2 in an RTPLAN and guessing it "
+        f"would misdescribe the beam, so this trial's export is refused."
+    )
+
+
+def _parse_wedge_info(beam, cp_data, machine, logger):
+    """Parse a beam's wedge into the fields a DICOM WedgeSequence needs.
+
+    Returns a dict with ``count``, ``type``, ``angle``, ``name`` and
+    ``orientation``, or ``None`` when the beam has no wedge.
+
+    Only the motorized wedge is converted.  It is the one type validated
+    against a Pinnacle RTPLAN export, where a ``SetBeamType`` of
+    "Motorized Wedge" produced WedgeType MOTORIZED, WedgeID "Motorized",
+    WedgeAngle 60 from the machine's NominalAngle, and WedgeOrientation 0
+    for a WedgeTopToBottom context.  Every other wedge type is refused
+    rather than converted on an unverified mapping.
+
+    Raises
+    ------
+    UnsupportedWedgeError
+        For a wedge type or orientation with no validated mapping.
+    """
+    wedge_name = (cp_data.get("WedgeContext") or {}).get("WedgeName")
+    if _normalise_wedge_name(wedge_name) in _NO_WEDGE_KEYS:
+        logger.debug("No wedge present")
         return None
 
-    info = {"count": 1, "angle": wedge_context["Angle"]}
-    orientation_raw = wedge_context["Orientation"]
+    beam_name = beam.get("Name")
+    set_beam_type = str(beam.get("SetBeamType", ""))
+    if "MOTORIZED" not in set_beam_type.upper():
+        raise UnsupportedWedgeError(
+            f"Beam '{beam_name}' uses wedge {wedge_name!r} with SetBeamType "
+            f"{set_beam_type!r}. Only the motorized wedge has been validated "
+            f"against a Pinnacle RTPLAN export; the wedge type, identifier "
+            f"and orientation mappings for other wedge types are unverified, "
+            f"and a wrong wedge is not visible in the converted plan. This "
+            f"trial's RTPLAN export is refused."
+        )
 
-    if "edw" in wedge_name_raw.lower():
-        # Enhanced Dynamic Wedge
-        plan_logger.debug("EDW wedge present")
-        info["type"] = "DYNAMIC"
-        if orientation_raw == "WedgeBottomToTop":
-            info["name"] = f"{wedge_name_raw.upper()}{info['angle']}IN"
-            info["orientation"] = "0"  # TODO confirm orientation mapping
-        elif orientation_raw == "WedgeTopToBottom":
-            info["name"] = f"{wedge_name_raw.upper()}{info['angle']}OUT"
-            info["orientation"] = "180"
-        plan_logger.debug("EDW wedge name = %s", info.get("name"))
+    orientation_raw = (cp_data.get("WedgeContext") or {}).get("Orientation")
+    orientation = _WEDGE_ORIENTATIONS.get(
+        str(orientation_raw or "").strip().casefold()
+    )
+    if orientation is None:
+        raise UnsupportedWedgeError(
+            f"Beam '{beam_name}': wedge orientation {orientation_raw!r} has "
+            f"no validated mapping to a DICOM WedgeOrientation. Only "
+            f"{', '.join(sorted(_WEDGE_ORIENTATIONS))} are supported; the "
+            f"lateral orientations differ only by which of 90 and 270 is "
+            f"which, which nothing in the Pinnacle data settles. This "
+            f"trial's RTPLAN export is refused."
+        )
 
-    elif "UP" in wedge_name_raw:
-        # Standard (Universal/Physical) wedge
-        plan_logger.debug("Standard wedge present")
-        info["type"] = "STANDARD"
-        angle_int = int(info["angle"])
-
-        # Map wedge angle to the machine-specific number suffix
-        angle_to_suffix = {15: "30", 30: "30", 45: "20", 60: "15"}
-        number_suffix = angle_to_suffix.get(angle_int, "")
-
-        orientation_to_label = {
-            "WedgeRightToLeft": ("R", "90"),
-            "WedgeLeftToRight": ("L", "270"),
-            "WedgeTopToBottom": ("OUT", "180"),
-            "WedgeBottomToTop": ("IN", "0"),
-        }
-        label, dicom_orientation = orientation_to_label.get(orientation_raw, ("", "0"))
-        info["name"] = f"W{angle_int}{label}{number_suffix}"
-        info["orientation"] = dicom_orientation  # TODO: confirm orientation values
-        plan_logger.debug("Standard wedge name = %s", info["name"])
-    else:
-        # Unknown wedge type — treat as no wedge
-        plan_logger.warning("Unrecognised wedge name: %s", wedge_name_raw)
-        return None
-
+    machine_entry = _machine_wedge_entry(machine, wedge_name)
+    info = {
+        "count": 1,
+        "type": "MOTORIZED",
+        "angle": _wedge_angle(wedge_name, machine_entry, beam_name, logger),
+        # Pinnacle's own export labels a motorized wedge this way rather
+        # than by the machine's wedge name.
+        "name": "Motorized",
+        "orientation": orientation,
+    }
+    logger.debug(
+        "Beam '%s': motorized wedge %s, angle %s, orientation %s.",
+        beam_name,
+        wedge_name,
+        info["angle"],
+        orientation,
+    )
     return info
 
 
@@ -1109,12 +1409,19 @@ def _set_cp_ssd(cp, cp_entry):
         cp.SourceToSurfaceDistance = _format_ds(ssd_mm)
 
 
-def _create_wedge_position_seq():
-    """Create a WedgePositionSequence for a control point with wedge IN."""
+def _create_wedge_position_seq(position="IN"):
+    """Create a WedgePositionSequence for one control point.
+
+    A motorized wedge is withdrawn part-way through the beam, so the
+    position is per control point: the segments Pinnacle records with the
+    wedge get "IN" and the rest "OUT".  Writing "IN" on every control
+    point, as this previously did, describes a delivery that never
+    happens.
+    """
     seq = _new_sequence()
     wp = _new_dataset()
-    wp.WedgePosition = "IN"
-    wp.ReferencedWedgeNumber = "1"
+    wp.WedgePosition = position
+    wp.ReferencedWedgeNumber = _WEDGE_NUMBER
     seq.append(wp)
     return seq
 
@@ -1123,7 +1430,7 @@ def _create_wedge_sequence(wedge_info):
     """Create the beam-level WedgeSequence from parsed wedge info."""
     seq = _new_sequence()
     wedge = _new_dataset()
-    wedge.WedgeNumber = 1
+    wedge.WedgeNumber = _WEDGE_NUMBER
     wedge.WedgeType = wedge_info["type"]
     wedge.WedgeAngle = wedge_info["angle"]
     wedge.WedgeID = wedge_info["name"]
@@ -1147,6 +1454,7 @@ def _populate_first_control_point(
     cp_entry,
     iso_center,
     decimals=None,
+    wedge_position="IN",
 ):
     """Populate all attributes required by DICOM for the first control point.
 
@@ -1201,7 +1509,7 @@ def _populate_first_control_point(
 
     # --- Wedge position (1C — required when wedges present) ---
     if numwedges > 0:
-        cp.WedgePositionSequence = _create_wedge_position_seq()
+        cp.WedgePositionSequence = _create_wedge_position_seq(wedge_position)
 
     # --- Beam Limiting Device positions (1C) ---
     cp.BeamLimitingDevicePositionSequence = _create_bld_position_entries(
@@ -1263,7 +1571,11 @@ def convert_plan(plan, export_path):
                 "Skipping RTPLAN for trial '%s': %s", trial_info["Name"], exc
             )
             continue
-        except (IsocenterNotFoundError, MachineDataNotFoundError) as exc:
+        except (
+            IsocenterNotFoundError,
+            MachineDataNotFoundError,
+            UnsupportedWedgeError,
+        ) as exc:
             # Refusing to guess geometry; surface
             # loudly so the operator knows this trial's RTPLAN was refused.
             plan.logger.error(
@@ -1467,11 +1779,11 @@ def convert_plan_for_trial(
             )
             beam_ds.RadiationType = ""
 
-        # Beam type
-        if "STATIC" in beam["SetBeamType"].upper():
-            beam_ds.BeamType = beam["SetBeamType"].upper()
-        else:
-            beam_ds.BeamType = "DYNAMIC"
+        # Beam type.  A motorized wedge beam is a sequence of static
+        # segments, not a dynamic delivery: Pinnacle's own export writes
+        # STATIC for it, where matching on the word "STATIC" in
+        # SetBeamType alone produced DYNAMIC.
+        beam_ds.BeamType = _dicom_beam_type(beam["SetBeamType"])
 
         beam_ds.TreatmentMachineName = beam["MachineNameAndVersion"].partition(":")[0]
 
@@ -1539,6 +1851,9 @@ def convert_plan_for_trial(
                     "collimator": cp_data["Collimator"],
                     "couch": cp_data["Couch"],
                     "ssd": _cp_ssd_mm(cp_data),
+                    "wedge": (cp_data.get("WedgeContext") or {}).get(
+                        "WedgeName"
+                    ),
                 }
             )
 
@@ -1550,14 +1865,8 @@ def convert_plan_for_trial(
                 f"Beam '{beam['Name']}' has no control points."
             )
 
-        # Wedge context is constant across a beam's control points in
-        # Pinnacle; read it from the first CP.
-        wedge_info = _parse_wedge_info(
-            cp_manager["ControlPointList"][0], plan.logger
-        )
         p_count = cp_data_list[0]["p_count"]
-
-        numwedges = wedge_info["count"] if wedge_info else 0
+        beam_wedge_name = _beam_wedge_name(cp_manager["ControlPointList"])
 
         # --- Prescription and energy ---
         # A missing prescription used to raise IndexError and abort the whole
@@ -1640,6 +1949,18 @@ def convert_plan_for_trial(
         # leaf boundary table.
         _reject_negated_leaf_coordinates(machine, beam["Name"])
 
+        # Parsed here rather than earlier because the wedge angle comes
+        # from the machine's WedgeList, which is only resolved above.
+        # Raises UnsupportedWedgeError for anything but a motorized wedge
+        # in a validated orientation.
+        wedge_info = _parse_wedge_info(
+            beam,
+            _wedge_control_point(cp_manager["ControlPointList"], beam_wedge_name),
+            machine,
+            plan.logger,
+        )
+        numwedges = wedge_info["count"] if wedge_info else 0
+
         # MLC LeafPositionBoundaries from the machine MultiLeaf layout.
         machine_boundaries = _leaf_boundaries_from_machine(
             machine, p_count // 2, plan.logger
@@ -1678,8 +1999,10 @@ def convert_plan_for_trial(
 
         prescripdose = beam["MonitorUnitInfo"]["PrescriptionDose"]
         normdose = beam["MonitorUnitInfo"]["NormalizedDose"]
-        collimator_of = _collimator_output_factor(beam, plan.logger)
-        _warn_on_unmodelled_transmission(beam, plan.logger)
+        collimator_of = _collimator_output_factor(
+            beam, machine, beam_wedge_name, plan.logger
+        )
+        transmission = _total_transmission_fraction(beam, plan.logger)
 
         if normdose == 0:
             # A zero-dose beam (a setup/verification field) still carries an
@@ -1703,15 +2026,14 @@ def convert_plan_for_trial(
                 machineenergyname,
             )
         else:
-            # CollimatorOutputFactor belongs in the denominator: Pinnacle's
-            # meterset is the prescription dose divided by the dose the
-            # machine actually delivers per MU *for this field*, and the
-            # collimator output factor is what carries the field-size
-            # dependence of that output.  Omitting it made every beam's
-            # meterset wrong by the amount the field's output departs from
-            # the calibration geometry.
+            # Pinnacle's own MU panel states the calculation as
+            #   Dose = MU x ND x OFc x TTF x (D/MU)cal
+            # so the meterset is that solved for MU.  Both OFc and TTF were
+            # previously missing, leaving every beam's meterset wrong by the
+            # amount its field output departs from the calibration geometry
+            # and by any tray or block transmission.
             meterset = prescripdose / (
-                normdose * dose_per_mu_at_cal * collimator_of
+                normdose * dose_per_mu_at_cal * collimator_of * transmission
             )
 
             # Formatted rather than assigned as raw floats: the division
@@ -1743,10 +2065,7 @@ def convert_plan_for_trial(
         # ===================================================================
         # Branch: Step & Shoot vs. Non-Step-and-Shoot
         # ===================================================================
-        is_step_and_shoot = (
-            "STEP" in beam["SetBeamType"].upper()
-            and "SHOOT" in beam["SetBeamType"].upper()
-        )
+        is_step_and_shoot = _uses_segment_control_points(beam["SetBeamType"])
 
         if is_step_and_shoot:
             _build_step_and_shoot_control_points(
@@ -1765,6 +2084,7 @@ def convert_plan_for_trial(
                 machine_boundaries,
                 beam_iso_center,
                 machine,
+                beam_wedge_name,
             )
         else:
             _build_non_ss_control_points(
@@ -1783,6 +2103,7 @@ def convert_plan_for_trial(
                 machine_boundaries,
                 beam_iso_center,
                 machine,
+                beam_wedge_name,
             )
 
         numwedges = 0  # Reset for next beam
@@ -1827,6 +2148,7 @@ def _build_step_and_shoot_control_points(
     machine_boundaries,
     iso_center,
     machine=None,
+    beam_wedge_name=None,
 ):
     """Build control points for a Step & Shoot beam.
 
@@ -1902,6 +2224,7 @@ def _build_step_and_shoot_control_points(
                 cp_entry,
                 iso_center,
                 decimals,
+                _cp_wedge_position(cp_entry, beam_wedge_name),
             )
         else:
             # Subsequent control points: this segment's own jaw and MLC
@@ -1914,6 +2237,12 @@ def _build_step_and_shoot_control_points(
                 cp_entry["leafpositions"],
                 decimals,
             )
+            if numwedges > 0:
+                # A motorized wedge moves between segments, so every
+                # control point states where it is.
+                cp.WedgePositionSequence = _create_wedge_position_seq(
+                    _cp_wedge_position(cp_entry, beam_wedge_name)
+                )
             _set_cp_ssd(cp, cp_entry)
 
     # Beam Limiting Device Sequence (beam level)
@@ -1943,6 +2272,7 @@ def _build_non_ss_control_points(
     machine_boundaries,
     iso_center,
     machine=None,
+    beam_wedge_name=None,
 ):
     """Build control points for a non-Step-and-Shoot beam (e.g. conformal arc).
 
@@ -2035,6 +2365,7 @@ def _build_non_ss_control_points(
                 cp_entry,
                 iso_center,
                 decimals,
+                _cp_wedge_position(cp_entry, beam_wedge_name),
             )
         else:
             # Subsequent control points carry only what changed since the
@@ -2073,6 +2404,11 @@ def _build_non_ss_control_points(
             if cp_entry["couch"] != previous["couch"]:
                 cp.PatientSupportAngle = cp_entry["couch"]
                 cp.PatientSupportRotationDirection = "NONE"
+
+            if numwedges > 0 and cp_entry.get("wedge") != previous.get("wedge"):
+                cp.WedgePositionSequence = _create_wedge_position_seq(
+                    _cp_wedge_position(cp_entry, beam_wedge_name)
+                )
 
             _set_cp_ssd(cp, cp_entry)
 

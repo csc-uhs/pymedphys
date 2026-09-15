@@ -1,3 +1,4 @@
 # line-specific gitignore filters
 .vscode/settings.json filter=gitignore-python-env-in-vscode-settings
 *.ipynb -linguist-detectable
+*.py text eol=lf
