@@ -867,37 +867,95 @@ def _set_bld_distance(device_ds, machine, device_type, logger):
     device_ds.SourceToBeamLimitingDeviceDistance = _format_ds(distance_mm)
 
 
-def _create_bld_position_entries(x1, x2, y1, y2, leafpositions):
+# Pinnacle stores collimation in cm to a machine-defined number of decimal
+# places and rounds to it on export; 2 is the value seen on every machine
+# examined so far and is used when the machine does not say.
+_DEFAULT_COLLIMATION_DECIMALS = 2
+
+
+def _collimation_decimals(machine):
+    """Millimetre decimal places for the X jaws, Y jaws and MLC.
+
+    Pinnacle's own RTPLAN export rounds collimation to the machine's
+    configured precision, so a jaw stored as 5.12285 cm is written as
+    -51.2 mm.  Exporting the unrounded value asserts a precision the
+    planning system never had and makes every jaw position differ from
+    Pinnacle's export in the last few digits.  One decimal place in cm is
+    one fewer in mm, hence the subtraction.
+    """
+    multileaf = {}
+    if isinstance(machine, dict):
+        multileaf = machine.get("MultiLeaf") or machine.get("MultiLeafLayout")
+        multileaf = multileaf if isinstance(multileaf, dict) else {}
+    else:
+        machine = {}
+
+    def decimals(scope, key):
+        raw = scope.get(key)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = _DEFAULT_COLLIMATION_DECIMALS
+        if value < 0:
+            value = _DEFAULT_COLLIMATION_DECIMALS
+        return max(value - 1, 0)
+
+    return {
+        "x": decimals(machine, "LeftRightDecimalPlaces"),
+        "y": decimals(machine, "TopBottomDecimalPlaces"),
+        "mlc": decimals(multileaf, "DecimalPlaces"),
+    }
+
+
+def _create_bld_position_entries(x1, x2, y1, y2, leafpositions, decimals=None):
     """Create the BeamLimitingDevicePositionSequence items for a control point.
 
     Returns a Sequence containing ASYMX and ASYMY entries, plus an MLCX
     entry when the beam has MLC leaf data (jaw-only beams legitimately
     have no MLCX device).
+
+    *decimals* is the mapping returned by :func:`_collimation_decimals`;
+    when omitted the values are written unrounded.
     """
     bld_seq = _new_sequence()
+    decimals = decimals or {}
 
-    # Formatted through _format_ds rather than handed to pydicom as raw
-    # floats: the cm -> mm multiplication leaves binary-float noise that
-    # pydicom renders in full (e.g. "-12.668299999999" for -12.6683),
-    # which wastes DS characters and makes diffs against Pinnacle's own
-    # export unreadable.
+    def position(value, device):
+        places = decimals.get(device)
+        if places is not None:
+            value = round(float(value), places)
+        # Formatted through _format_ds rather than handed to pydicom as a
+        # raw float: the cm -> mm multiplication leaves binary-float noise
+        # that pydicom renders in full (e.g. "-12.668299999999" for
+        # -12.6683), which wastes DS characters and makes diffs against
+        # Pinnacle's own export unreadable.
+        return _format_ds(value)
+
     asymx = _new_dataset()
     asymx.RTBeamLimitingDeviceType = "ASYMX"
-    asymx.LeafJawPositions = [_format_ds(x1), _format_ds(x2)]
+    asymx.LeafJawPositions = [position(x1, "x"), position(x2, "x")]
     bld_seq.append(asymx)
 
     asymy = _new_dataset()
     asymy.RTBeamLimitingDeviceType = "ASYMY"
-    asymy.LeafJawPositions = [_format_ds(y1), _format_ds(y2)]
+    asymy.LeafJawPositions = [position(y1, "y"), position(y2, "y")]
     bld_seq.append(asymy)
 
     if leafpositions:
         mlcx = _new_dataset()
         mlcx.RTBeamLimitingDeviceType = "MLCX"
-        mlcx.LeafJawPositions = [_format_ds(v) for v in leafpositions]
+        mlcx.LeafJawPositions = [position(v, "mlc") for v in leafpositions]
         bld_seq.append(mlcx)
 
     return bld_seq
+
+
+def _collimation_changed(previous, current):
+    """True when any jaw or leaf position differs between control points."""
+    for key in ("x1", "x2", "y1", "y2"):
+        if previous.get(key) != current.get(key):
+            return True
+    return previous.get("leafpositions") != current.get("leafpositions")
 
 
 def _set_cp_ssd(cp, cp_entry):
@@ -949,6 +1007,7 @@ def _populate_first_control_point(
     numwedges,
     cp_entry,
     iso_center,
+    decimals=None,
 ):
     """Populate all attributes required by DICOM for the first control point.
 
@@ -1012,6 +1071,7 @@ def _populate_first_control_point(
         cp_entry["y1"],
         cp_entry["y2"],
         cp_entry["leafpositions"],
+        decimals,
     )
 
     # --- Beam-level counts (Type 1 — placed here for locality but belong to beam) ---
@@ -1190,6 +1250,7 @@ def convert_plan_for_trial(
     # --- Sequences that are populated per-beam ---
     ds.BeamSequence = _new_sequence()
     ds.PatientSetupSequence = _new_sequence()
+    patient_setups = {}  # PatientPosition -> PatientSetupNumber
 
     beam_count = 0
 
@@ -1209,11 +1270,18 @@ def convert_plan_for_trial(
         # cumulative weights parsed from an earlier beam.
         metersetweight = ["0"]
 
-        # --- Patient Setup (one per beam) ---
-        patient_setup = _new_dataset()
-        patient_setup.PatientPosition = patient_position
-        patient_setup.PatientSetupNumber = beam_count
-        ds.PatientSetupSequence.append(patient_setup)
+        # --- Patient Setup (shared by beams in the same position) ---
+        # Pinnacle's own export writes one setup item and points every beam
+        # at it.  Emitting a duplicate per beam is legal but implies the
+        # patient is repositioned between beams that in fact share a setup.
+        setup_number = patient_setups.get(patient_position)
+        if setup_number is None:
+            setup_number = len(patient_setups) + 1
+            patient_setups[patient_position] = setup_number
+            patient_setup = _new_dataset()
+            patient_setup.PatientPosition = patient_position
+            patient_setup.PatientSetupNumber = setup_number
+            ds.PatientSetupSequence.append(patient_setup)
 
         # --- Referenced Beam ---
         # Appended to its prescription's fraction group further down, once
@@ -1228,7 +1296,7 @@ def convert_plan_for_trial(
         beam_ds.Manufacturer = ds.Manufacturer  # Consistent with plan-level stamp
         beam_ds.BeamNumber = beam_count
         beam_ds.TreatmentDeliveryType = "TREATMENT"
-        beam_ds.ReferencedPatientSetupNumber = beam_count
+        beam_ds.ReferencedPatientSetupNumber = setup_number
         # SourceAxisDistance is overridden below from the
         # Pinnacle machine data once the beam's machine has been resolved;
         # 1000 mm remains only as a logged fallback.
@@ -1619,6 +1687,8 @@ def _build_step_and_shoot_control_points(
     """
     plan.logger.debug("Using Step & Shoot")
 
+    decimals = _collimation_decimals(machine)
+
     total_cps = numctrlpts * 2
     beam_ds.NumberOfControlPoints = total_cps
     # SourceToSurfaceDistance (300A,0130) is defined on the Control Point
@@ -1677,6 +1747,7 @@ def _build_step_and_shoot_control_points(
                 numwedges,
                 cp_entry,
                 iso_center,
+                decimals,
             )
         else:
             # Subsequent control points: this segment's own jaw and MLC
@@ -1687,6 +1758,7 @@ def _build_step_and_shoot_control_points(
                 cp_entry["y1"],
                 cp_entry["y2"],
                 cp_entry["leafpositions"],
+                decimals,
             )
             _set_cp_ssd(cp, cp_entry)
 
@@ -1732,6 +1804,8 @@ def _build_non_ss_control_points(
     deltas, so beams that reverse direction mid-delivery are represented.
     """
     plan.logger.debug("Not using Step & Shoot")
+
+    decimals = _collimation_decimals(machine)
 
     # Pinnacle's per-control-point Weight is the fraction of the beam's
     # meterset delivered in the segment *starting* at that point, so N
@@ -1806,22 +1880,46 @@ def _build_non_ss_control_points(
                 numwedges,
                 cp_entry,
                 iso_center,
+                decimals,
             )
         else:
-            # Subsequent control points: this control point's own jaw and
-            # MLC positions.
-            cp.BeamLimitingDevicePositionSequence = _create_bld_position_entries(
-                cp_entry["x1"],
-                cp_entry["x2"],
-                cp_entry["y1"],
-                cp_entry["y2"],
-                cp_entry["leafpositions"],
-            )
+            # Subsequent control points carry only what changed since the
+            # previous one, which is both what DICOM asks for and what
+            # Pinnacle's own export does: a static beam's terminating
+            # control point holds nothing but its cumulative weight.
+            # Repeating unchanged collimation is legal but asserts a
+            # machine movement that does not happen, and buries the
+            # control points that do move.
+            previous = cp_data_list[min(j - 1, len(cp_data_list) - 1)]
 
-            # per-control-point gantry angle and rotation
-            # direction so direction reversals mid-delivery are captured.
-            cp.GantryAngle = cp_entry["gantry"]
-            cp.GantryRotationDirection = gantry_directions[j]
+            if _collimation_changed(previous, cp_entry):
+                cp.BeamLimitingDevicePositionSequence = (
+                    _create_bld_position_entries(
+                        cp_entry["x1"],
+                        cp_entry["x2"],
+                        cp_entry["y1"],
+                        cp_entry["y2"],
+                        cp_entry["leafpositions"],
+                        decimals,
+                    )
+                )
+
+            # The rotation direction accompanies the angle: it qualifies
+            # the movement to the next control point, so writing one
+            # without the other says nothing useful.  Direction reversals
+            # mid-delivery are captured because the angle changes there too.
+            if cp_entry["gantry"] != previous["gantry"]:
+                cp.GantryAngle = cp_entry["gantry"]
+                cp.GantryRotationDirection = gantry_directions[j]
+
+            if cp_entry["collimator"] != previous["collimator"]:
+                cp.BeamLimitingDeviceAngle = cp_entry["collimator"]
+                cp.BeamLimitingDeviceRotationDirection = "NONE"
+
+            if cp_entry["couch"] != previous["couch"]:
+                cp.PatientSupportAngle = cp_entry["couch"]
+                cp.PatientSupportRotationDirection = "NONE"
+
             _set_cp_ssd(cp, cp_entry)
 
     # Beam Limiting Device Sequence (beam level)
