@@ -401,6 +401,145 @@ def _reject_negated_leaf_coordinates(machine, beam_name):
     )
 
 
+# A collimator output factor outside this band is implausible for a photon
+# field and more likely a parse problem than real machine data.
+_PLAUSIBLE_OUTPUT_FACTOR = (0.8, 1.25)
+
+# Relative and absolute tolerances for the meterset cross-check below.
+_METERSET_REL_TOL = 0.002
+_METERSET_ABS_TOL = 0.1
+
+
+def _collimator_output_factor(beam, logger):
+    """Field-size output factor for the beam's meterset denominator.
+
+    Returns 1.0 (a no-op) when Pinnacle has no usable value, so a missing
+    factor leaves the previous behaviour rather than producing a zero or
+    negative meterset.
+    """
+    raw = (beam.get("MonitorUnitInfo") or {}).get("CollimatorOutputFactor")
+    try:
+        factor = float(raw)
+    except (TypeError, ValueError):
+        factor = None
+
+    if not factor or factor <= 0:
+        logger.warning(
+            "Beam '%s': no usable CollimatorOutputFactor in MonitorUnitInfo "
+            "(found %r). BeamMeterset is computed without it, which will "
+            "under- or over-state the monitor units by the amount this "
+            "field's output departs from the calibration geometry. Verify "
+            "the meterset before clinical use.",
+            beam.get("Name"),
+            raw,
+        )
+        return 1.0
+
+    low, high = _PLAUSIBLE_OUTPUT_FACTOR
+    if not low <= factor <= high:
+        logger.warning(
+            "Beam '%s': CollimatorOutputFactor is %s, outside the plausible "
+            "range %s-%s. It is still applied, but check the machine data: "
+            "this value scales BeamMeterset directly.",
+            beam.get("Name"),
+            factor,
+            low,
+            high,
+        )
+    return factor
+
+
+def _warn_on_unmodelled_transmission(beam, logger):
+    """Flag beams whose meterset depends on a transmission we do not apply.
+
+    TotalTransmissionFraction covers trays, blocks and wedges.  Every plan
+    this exporter has been validated against had it at 1.0, so where it
+    enters Pinnacle's meterset chain is unverified and applying it would
+    be a guess.  A beam that actually carries a transmission is therefore
+    reported rather than silently converted.
+    """
+    raw = (beam.get("MonitorUnitInfo") or {}).get("TotalTransmissionFraction")
+    try:
+        transmission = float(raw)
+    except (TypeError, ValueError):
+        return
+
+    if abs(transmission - 1.0) <= 1e-9:
+        return
+
+    logger.warning(
+        "Beam '%s': TotalTransmissionFraction is %s, not 1.0 (a tray, block "
+        "or wedge is in the beam). This exporter's meterset calculation does "
+        "not apply it, because no validated plan was available to confirm "
+        "where it enters Pinnacle's calculation. BeamMeterset may be wrong "
+        "by roughly %.2f%% for this beam -- check it against Pinnacle before "
+        "clinical use.",
+        beam.get("Name"),
+        transmission,
+        abs(1.0 - transmission) * 100,
+    )
+
+
+def _verify_metersets(checks, logger):
+    """Compare computed metersets against Pinnacle's own stored value.
+
+    Pinnacle records RequestedMonitorUnitsPerFraction on the prescription.
+    Where a prescription drives exactly one beam, that value and the beam's
+    meterset are the same quantity, which makes it a free check on the
+    whole meterset calculation -- the sort of drift that otherwise only
+    surfaces by diffing against a Pinnacle export by hand.
+
+    Prescriptions driving several beams are skipped: whether the stored
+    value is the per-beam or the per-prescription total cannot be
+    determined from the data, and guessing would produce false alarms.
+    """
+    by_prescription = {}
+    for prescription, beam_name, meterset in checks:
+        key = str((prescription or {}).get("Name", ""))
+        by_prescription.setdefault(key, []).append((prescription, beam_name,
+                                                    meterset))
+
+    for key, entries in by_prescription.items():
+        if len(entries) != 1:
+            continue
+        prescription, beam_name, meterset = entries[0]
+
+        try:
+            expected = float(
+                (prescription or {}).get("RequestedMonitorUnitsPerFraction")
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if expected <= 0:
+            continue
+
+        difference = abs(meterset - expected)
+        if difference <= max(_METERSET_ABS_TOL,
+                             _METERSET_REL_TOL * expected):
+            logger.debug(
+                "Beam '%s': BeamMeterset %s agrees with Pinnacle's "
+                "RequestedMonitorUnitsPerFraction (%s).",
+                beam_name,
+                meterset,
+                expected,
+            )
+            continue
+
+        logger.warning(
+            "Beam '%s': computed BeamMeterset is %s but Pinnacle recorded "
+            "RequestedMonitorUnitsPerFraction of %s for prescription %r -- a "
+            "difference of %s MU (%.3f%%). The exported plan uses the "
+            "computed value; investigate before clinical use.",
+            beam_name,
+            meterset,
+            expected,
+            key,
+            difference,
+            difference / expected * 100,
+        )
+
+
 def _resolve_beam_isocenter(plan, beam):
     """Resolve the isocenter for a specific beam.
 
@@ -1251,6 +1390,7 @@ def convert_plan_for_trial(
     ds.BeamSequence = _new_sequence()
     ds.PatientSetupSequence = _new_sequence()
     patient_setups = {}  # PatientPosition -> PatientSetupNumber
+    meterset_checks = []  # (prescription, beam name, computed meterset)
 
     beam_count = 0
 
@@ -1538,6 +1678,8 @@ def convert_plan_for_trial(
 
         prescripdose = beam["MonitorUnitInfo"]["PrescriptionDose"]
         normdose = beam["MonitorUnitInfo"]["NormalizedDose"]
+        collimator_of = _collimator_output_factor(beam, plan.logger)
+        _warn_on_unmodelled_transmission(beam, plan.logger)
 
         if normdose == 0:
             # A zero-dose beam (a setup/verification field) still carries an
@@ -1561,13 +1703,23 @@ def convert_plan_for_trial(
                 machineenergyname,
             )
         else:
+            # CollimatorOutputFactor belongs in the denominator: Pinnacle's
+            # meterset is the prescription dose divided by the dose the
+            # machine actually delivers per MU *for this field*, and the
+            # collimator output factor is what carries the field-size
+            # dependence of that output.  Omitting it made every beam's
+            # meterset wrong by the amount the field's output departs from
+            # the calibration geometry.
+            meterset = prescripdose / (
+                normdose * dose_per_mu_at_cal * collimator_of
+            )
+
             # Formatted rather than assigned as raw floats: the division
             # leaves noise that pydicom renders in full, which can run a
             # DS value up against its 16-character limit.
             ref_beam.BeamDose = _format_ds(prescripdose / 100)
-            ref_beam.BeamMeterset = _format_ds(
-                prescripdose / (normdose * dose_per_mu_at_cal)
-            )
+            ref_beam.BeamMeterset = _format_ds(meterset)
+            meterset_checks.append((prescription, beam["Name"], meterset))
 
         # Gantry rotation direction
         is_ccw = cp_manager.get("GantryIsCCW") == 1
@@ -1634,6 +1786,8 @@ def convert_plan_for_trial(
             )
 
         numwedges = 0  # Reset for next beam
+
+    _verify_metersets(meterset_checks, plan.logger)
 
     # --- Fraction group summaries ---
     # NumberOfBeams is per group, not the trial-wide beam count.
