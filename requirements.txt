@@ -244,7 +244,7 @@ plotly==6.9.0
     #   pymedphys
 protobuf==7.35.1
     # via streamlit
-pyarrow==24.0.0
+pyarrow==25.0.1
     # via streamlit
 pycparser==3.0 ; (implementation_name != 'PyPy' and implementation_name != 'pypy' and os_name == 'nt' and platform_python_implementation == 'PyPy') or (implementation_name != 'PyPy' and implementation_name != 'pypy' and os_name == 'nt' and sys_platform != 'linux') or (implementation_name != 'PyPy' and platform_python_implementation != 'PyPy' and sys_platform == 'linux')
     # via cffi
