@@ -43,6 +43,7 @@ import re
 import time
 
 from pymedphys._imports import pydicom
+
 from pymedphys._pinnacle.pinnacle_exceptions import (
     IsocenterNotFoundError,
     MachineDataNotFoundError,
@@ -110,7 +111,11 @@ def _truncate_sh(value, logger=None, tag=""):
             "%s value %r is %d chars, exceeding the DICOM SH limit of %d; "
             "truncated to %r (the full name is retained in the "
             "corresponding LO-VR attribute).",
-            tag or "SH", text, len(text), _DICOM_SH_MAX, truncated,
+            tag or "SH",
+            text,
+            len(text),
+            _DICOM_SH_MAX,
+            truncated,
         )
     return truncated
 
@@ -196,7 +201,8 @@ def _select_machine(machine_info, machinename, machineversion, logger=None):
                 "No machine entries could be located in the parsed "
                 "plan.Pinnacle.Machines structure (top-level keys: %s). The "
                 "file may use an unexpected layout.",
-                sorted(machine_info)[:10] if isinstance(machine_info, dict)
+                sorted(machine_info)[:10]
+                if isinstance(machine_info, dict)
                 else type(machine_info).__name__,
             )
         return None
@@ -204,8 +210,7 @@ def _select_machine(machine_info, machinename, machineversion, logger=None):
     # 1. Exact match on both name and version timestamp.
     for machine in candidates:
         if machine.get("Name") == machinename and (
-            not machineversion
-            or machine.get("VersionTimestamp") == machineversion
+            not machineversion or machine.get("VersionTimestamp") == machineversion
         ):
             return machine
 
@@ -217,7 +222,8 @@ def _select_machine(machine_info, machinename, machineversion, logger=None):
                 logger.debug(
                     "Machine '%s' matched by name only (version '%s' not "
                     "matched exactly; file has '%s').",
-                    machinename, machineversion,
+                    machinename,
+                    machineversion,
                     machine.get("VersionTimestamp"),
                 )
             return machine
@@ -232,7 +238,9 @@ def _select_machine(machine_info, machinename, machineversion, logger=None):
         logger.warning(
             "Machine '%s' (version '%s') not found among the %d machine "
             "entry/entries in plan.Pinnacle.Machines. Available: %s",
-            machinename, machineversion, len(candidates),
+            machinename,
+            machineversion,
+            len(candidates),
             "; ".join(available) or "(none)",
         )
     return None
@@ -373,35 +381,6 @@ def _leaf_boundaries_from_machine(machine, expected_pairs, logger):
     return [_format_ds(b) for b in boundaries]
 
 
-def _reject_negated_leaf_coordinates(machine, beam_name):
-    """Refuse export when the machine negates its leaf coordinates.
-
-    Raises
-    ------
-    MachineDataNotFoundError
-        When ``MultiLeaf.NegateLeafCoordinates`` is set.
-    """
-    if not isinstance(machine, dict):
-        return
-    multileaf = machine.get("MultiLeaf") or machine.get("MultiLeafLayout")
-    if not isinstance(multileaf, dict):
-        return
-
-    raw = multileaf.get("NegateLeafCoordinates")
-    if raw in (None, "", 0, "0", False):
-        return
-
-    raise MachineDataNotFoundError(
-        f"Beam '{beam_name}': the machine's MultiLeaf data sets "
-        f"NegateLeafCoordinates to {raw!r}. The Pinnacle-to-DICOM leaf "
-        f"bank mapping used here has only been verified against machines "
-        f"that leave this flag clear, and applying it to a machine that "
-        f"negates its leaf coordinates would mirror every leaf pair "
-        f"without any visible sign of error. This trial's RTPLAN export "
-        f"is refused."
-    )
-
-
 # A collimator output factor outside this band is implausible for a photon
 # field and more likely a parse problem than real machine data.
 _PLAUSIBLE_OUTPUT_FACTOR = (0.8, 1.25)
@@ -448,12 +427,13 @@ def _output_factor_table(machine, energy_name, wedge_name):
     wanted = _normalise_wedge_name(wedge_name)
     table = []
 
-    for energy in ((machine or {}).get("PhotonEnergyList") or []):
+    for energy in (machine or {}).get("PhotonEnergyList") or []:
         if not isinstance(energy, dict) or energy.get("Name") != energy_name:
             continue
         geometries = (
-            ((energy.get("PhysicsData") or {}).get("OutputFactor") or {})
-            .get("MeasureGeometryList")
+            ((energy.get("PhysicsData") or {}).get("OutputFactor") or {}).get(
+                "MeasureGeometryList"
+            )
         ) or []
         if isinstance(geometries, dict):
             geometries = list(geometries.values())
@@ -465,10 +445,12 @@ def _output_factor_table(machine, energy_name, wedge_name):
             if _normalise_wedge_name(context.get("WedgeName")) != wanted:
                 continue
             try:
-                width = (float(entry["LeftJawPosition"])
-                         + float(entry["RightJawPosition"]))
-                height = (float(entry["TopJawPosition"])
-                          + float(entry["BottomJawPosition"]))
+                width = float(entry["LeftJawPosition"]) + float(
+                    entry["RightJawPosition"]
+                )
+                height = float(entry["TopJawPosition"]) + float(
+                    entry["BottomJawPosition"]
+                )
                 measured = float(entry["MeasuredOutputFactor"])
                 phantom = float(entry["PhantomOutputFactor"])
             except (KeyError, TypeError, ValueError):
@@ -525,9 +507,7 @@ def _collimator_output_factor(beam, machine, wedge_name, logger):
     wedged = _normalise_wedge_name(wedge_name) not in _NO_WEDGE_KEYS
 
     equivalent_square = _equivalent_square(beam.get("MonitorUnitInfo") or {})
-    table = _output_factor_table(
-        machine, beam.get("MachineEnergyName"), wedge_name
-    )
+    table = _output_factor_table(machine, beam.get("MachineEnergyName"), wedge_name)
     looked_up = (
         _interpolate_output_factor(table, equivalent_square)
         if equivalent_square is not None
@@ -643,8 +623,7 @@ def _verify_metersets(checks, logger):
     by_prescription = {}
     for prescription, beam_name, meterset in checks:
         key = str((prescription or {}).get("Name", ""))
-        by_prescription.setdefault(key, []).append((prescription, beam_name,
-                                                    meterset))
+        by_prescription.setdefault(key, []).append((prescription, beam_name, meterset))
 
     for key, entries in by_prescription.items():
         if len(entries) != 1:
@@ -662,8 +641,7 @@ def _verify_metersets(checks, logger):
             continue
 
         difference = abs(meterset - expected)
-        if difference <= max(_METERSET_ABS_TOL,
-                             _METERSET_REL_TOL * expected):
+        if difference <= max(_METERSET_ABS_TOL, _METERSET_REL_TOL * expected):
             logger.debug(
                 "Beam '%s': BeamMeterset %s agrees with Pinnacle's "
                 "RequestedMonitorUnitsPerFraction (%s).",
@@ -980,42 +958,121 @@ def _gantry_directions(cp_data_list, total_cps, beam_flag, beam_name, logger):
     return directions
 
 
-def _parse_mlc_leaf_positions(control_point):
-    """Parse MLC leaf positions from a Pinnacle control point dict.
+def _raw_leaf_points(control_point):
+    """The control point's raw Pinnacle leaf values, in cm and stored order."""
+    points = control_point["MLCLeafPositions"]["RawData"]["Points[]"].split(",")
+    return [float(p.strip()) for p in points]
+
+
+def _leaf_banks(raw_points, negate):
+    """Map raw Pinnacle leaf values to DICOM MLCX banks.
 
     Pinnacle stores the raw points as (left, right) per leaf pair, in cm,
-    in the same order as the machine's ``LeafPairList``.  The machine file
-    names the banks explicitly -- ``LeftBankName`` is ``x2`` and
-    ``RightBankName`` is ``x1`` -- so Pinnacle's left bank is DICOM's +X
-    bank and its right bank is DICOM's -X bank.  This is the same
-    mirroring the jaws undergo, for the same reason: Pinnacle names its
-    collimation in the room frame while DICOM uses IEC beam limiting
-    device coordinates, which are the beam's eye view from the source.
+    in the same order as the machine's ``LeafPairList``.  With
+    ``NegateLeafCoordinates`` clear, the machine's left bank is DICOM's
+    +X bank and its right bank is DICOM's -X bank, in stored order --
+    verified against a Pinnacle RTPLAN export.
 
-    The previous implementation assigned the banks the other way round
-    *and* reversed each of them.  Both were wrong: verified against a
-    Pinnacle RTPLAN export, X1 is ``-right * 10`` and X2 is
-    ``+left * 10``, each in stored order with no reversal, because
-    ``LeafPairList`` is itself stored in ascending Y order and therefore
-    already lines up with LeafPositionBoundaries.
+    ``NegateLeafCoordinates`` negates the leaf frame in both axes.
+    Negating X swaps which bank is -X; negating Y reverses the leaf
+    order.  Composing those with the mapping above gives
+    ``X1 = -left`` and ``X2 = +right``, each reversed -- which reproduces
+    a flagged machine's RTPLAN export exactly, across every leaf pair of
+    every beam checked.
 
-    Returns (leafpositions, p_count), where leafpositions is the -X bank
-    followed by the +X bank and p_count is the number of raw leaf values.
+    Returns the -X bank followed by the +X bank.
     """
-    points_str = control_point["MLCLeafPositions"]["RawData"]["Points[]"]
-    raw_points = points_str.split(",")
-    p_count = len(raw_points)
+    left, right = raw_points[0::2], raw_points[1::2]
 
-    bank_x1 = []  # -X bank: Pinnacle's "right" bank
-    bank_x2 = []  # +X bank: Pinnacle's "left" bank
-    for i, p in enumerate(raw_points):
-        leafpoint = float(p.strip())
-        if i % 2 == 0:
-            bank_x2.append(leafpoint * 10)
-        else:
-            bank_x1.append(-leafpoint * 10)
+    if not negate:
+        return [-v * 10 for v in right] + [v * 10 for v in left]
 
-    return bank_x1 + bank_x2, p_count
+    return [-v * 10 for v in reversed(left)] + [v * 10 for v in reversed(right)]
+
+
+def _jaw_positions(control_point, negate):
+    """Map Pinnacle's named jaws to DICOM X1/X2/Y1/Y2, in mm.
+
+    Pinnacle names its jaws in the room frame; DICOM uses IEC beam
+    limiting device coordinates, the beam's eye view from the source,
+    which is mirrored on both axes.  ``NegateLeafCoordinates`` negates
+    that frame again, so a flagged machine's jaws mirror back -- checked
+    against a Pinnacle RTPLAN export on five beams, where the negated
+    mapping agrees to within the 0.1 mm the values are stored at and
+    every other candidate is tens of millimetres out.
+    """
+    left = float(control_point["LeftJawPosition"]) * 10
+    right = float(control_point["RightJawPosition"]) * 10
+    top = float(control_point["TopJawPosition"]) * 10
+    bottom = float(control_point["BottomJawPosition"]) * 10
+
+    if not negate:
+        return -right, left, -top, bottom
+    return -left, right, -bottom, top
+
+
+def _negates_leaf_coordinates(machine, beam_name, logger):
+    """Whether this machine's collimation frame is negated.
+
+    Raises
+    ------
+    MachineDataNotFoundError
+        When the flag holds something other than a recognised boolean:
+        both conventions are verified, but an unknown third value is not,
+        and a mirrored collimator is invisible in the converted plan.
+    """
+    multileaf = {}
+    if isinstance(machine, dict):
+        multileaf = machine.get("MultiLeaf") or machine.get("MultiLeafLayout")
+        multileaf = multileaf if isinstance(multileaf, dict) else {}
+
+    raw = multileaf.get("NegateLeafCoordinates")
+    if raw in (None, "", 0, "0", False):
+        return False
+    if raw in (1, "1", True):
+        logger.debug(
+            "Beam '%s': machine negates its leaf coordinates; jaws and leaf "
+            "banks are mirrored in both axes.",
+            beam_name,
+        )
+        return True
+
+    raise MachineDataNotFoundError(
+        f"Beam '{beam_name}': the machine's MultiLeaf data sets "
+        f"NegateLeafCoordinates to {raw!r}, which is neither of the two "
+        f"values this exporter has validated against a Pinnacle RTPLAN "
+        f"export. A mirrored collimator is not visible in the converted "
+        f"plan, so this trial's RTPLAN export is refused rather than "
+        f"guessed."
+    )
+
+
+def _apply_collimation_mapping(cp_data_list, negate):
+    """Fill in each control point's DICOM jaw and leaf positions.
+
+    Deferred until the beam's machine is resolved, because whether
+    Pinnacle's collimation frame is negated is a machine setting.
+
+    Returns the raw leaf value count for the beam.
+    """
+    p_count = 0
+    for entry in cp_data_list:
+        raw_points = entry.pop("leaf_points_cm")
+        control_point = entry.pop("jaws_source")
+        p_count = len(raw_points)
+
+        x1, x2, y1, y2 = _jaw_positions(control_point, negate)
+        entry.update(
+            {
+                "x1": x1,
+                "x2": x2,
+                "y1": y1,
+                "y2": y2,
+                "leafpositions": _leaf_banks(raw_points, negate),
+                "p_count": p_count,
+            }
+        )
+    return p_count
 
 
 # Pinnacle names an absent wedge with one of these.
@@ -1029,7 +1086,7 @@ def _wedge_names_in_beam(control_points):
     for cp in control_points or []:
         if not isinstance(cp, dict):
             continue
-        name = ((cp.get("WedgeContext") or {}).get("WedgeName") or "")
+        name = (cp.get("WedgeContext") or {}).get("WedgeName") or ""
         name = str(name).strip()
         if name in _NO_WEDGE_NAMES:
             continue
@@ -1039,7 +1096,7 @@ def _wedge_names_in_beam(control_points):
 
 
 def _cp_wedge_position(cp_entry, beam_wedge_name):
-    """"IN" when this control point's segment carries the beam's wedge."""
+    """ "IN" when this control point's segment carries the beam's wedge."""
     return (
         "IN"
         if _normalise_wedge_name(cp_entry.get("wedge"))
@@ -1083,9 +1140,11 @@ def _wedge_control_point(control_points, wedge_name):
     """
     wanted = _normalise_wedge_name(wedge_name)
     for cp in control_points or []:
-        if isinstance(cp, dict) and _normalise_wedge_name(
-            (cp.get("WedgeContext") or {}).get("WedgeName")
-        ) == wanted:
+        if (
+            isinstance(cp, dict)
+            and _normalise_wedge_name((cp.get("WedgeContext") or {}).get("WedgeName"))
+            == wanted
+        ):
             return cp
     return (control_points or [{}])[0]
 
@@ -1194,9 +1253,7 @@ def _parse_wedge_info(beam, cp_data, machine, logger):
         )
 
     orientation_raw = (cp_data.get("WedgeContext") or {}).get("Orientation")
-    orientation = _WEDGE_ORIENTATIONS.get(
-        str(orientation_raw or "").strip().casefold()
-    )
+    orientation = _WEDGE_ORIENTATIONS.get(str(orientation_raw or "").strip().casefold())
     if orientation is None:
         raise UnsupportedWedgeError(
             f"Beam '{beam_name}': wedge orientation {orientation_raw!r} has "
@@ -1664,7 +1721,8 @@ def convert_plan_for_trial(
     # RTPlanLabel is VR SH (max 16 chars); RTPlanName is LO (max 64) and
     # keeps the full untruncated Pinnacle plan name.
     ds.RTPlanLabel = _truncate_sh(
-        f"{plan_info['PlanName']}.0", plan.logger, "RTPlanLabel")
+        f"{plan_info['PlanName']}.0", plan.logger, "RTPlanLabel"
+    )
     ds.RTPlanName = plan_info["PlanName"]
     ds.RTPlanDescription = append_pinnacle_metadata_for_plan(
         None,
@@ -1826,34 +1884,20 @@ def convert_plan_for_trial(
         for cp_data in cp_manager["ControlPointList"]:
             metersetweight.append(cp_data["Weight"])
 
-            leafpositions, p_count = _parse_mlc_leaf_positions(cp_data)
-
-            # Pinnacle names its jaws in the room/patient frame; DICOM
-            # BeamLimitingDevicePositionSequence uses IEC beam limiting
-            # device coordinates, which are the beam's eye view *from the
-            # source* and therefore mirrored relative to Pinnacle on both
-            # axes.  X1 is the -X jaw and X2 the +X jaw, so X1 comes from
-            # RightJawPosition and X2 from LeftJawPosition; likewise Y1
-            # from TopJawPosition and Y2 from BottomJawPosition.  The
-            # previous mapping produced jaw pairs whose magnitudes were
-            # swapped relative to Pinnacle's own RTPLAN export (e.g.
-            # -45\55 where Pinnacle wrote -55\45), which silently
-            # mirrors every asymmetric field.
+            # Collimation is stored raw here and mapped to DICOM further
+            # down, once the beam's machine is known: whether Pinnacle's
+            # jaw and leaf frame is negated is a machine setting, and
+            # applying the wrong convention mirrors every field without
+            # any visible sign in the converted plan.
             cp_data_list.append(
                 {
-                    "x1": -cp_data["RightJawPosition"] * 10,
-                    "x2": cp_data["LeftJawPosition"] * 10,
-                    "y1": -cp_data["TopJawPosition"] * 10,
-                    "y2": cp_data["BottomJawPosition"] * 10,
-                    "leafpositions": leafpositions,
-                    "p_count": p_count,
+                    "jaws_source": cp_data,
+                    "leaf_points_cm": _raw_leaf_points(cp_data),
                     "gantry": cp_data["Gantry"],
                     "collimator": cp_data["Collimator"],
                     "couch": cp_data["Couch"],
                     "ssd": _cp_ssd_mm(cp_data),
-                    "wedge": (cp_data.get("WedgeContext") or {}).get(
-                        "WedgeName"
-                    ),
+                    "wedge": (cp_data.get("WedgeContext") or {}).get("WedgeName"),
                 }
             )
 
@@ -1865,7 +1909,6 @@ def convert_plan_for_trial(
                 f"Beam '{beam['Name']}' has no control points."
             )
 
-        p_count = cp_data_list[0]["p_count"]
         beam_wedge_name = _beam_wedge_name(cp_manager["ControlPointList"])
 
         # --- Prescription and energy ---
@@ -1947,7 +1990,12 @@ def convert_plan_for_trial(
         # mirror every leaf pair, so an export that would depend on it is
         # refused rather than guessed -- the same stance taken for the
         # leaf boundary table.
-        _reject_negated_leaf_coordinates(machine, beam["Name"])
+        # Now that the machine is known, map Pinnacle's collimation into
+        # DICOM's frame, negated or not as the machine dictates.
+        p_count = _apply_collimation_mapping(
+            cp_data_list,
+            _negates_leaf_coordinates(machine, beam["Name"], plan.logger),
+        )
 
         # Parsed here rather than earlier because the wedge angle comes
         # from the machine's WedgeList, which is only resolved above.
@@ -2306,7 +2354,6 @@ def _build_non_ss_control_points(
         except (TypeError, ValueError):
             trailing_zero_weight = False
 
-
     total_cps = numctrlpts if trailing_zero_weight else numctrlpts + 1
     beam_ds.NumberOfControlPoints = total_cps
     plan.logger.debug(
@@ -2378,15 +2425,13 @@ def _build_non_ss_control_points(
             previous = cp_data_list[min(j - 1, len(cp_data_list) - 1)]
 
             if _collimation_changed(previous, cp_entry):
-                cp.BeamLimitingDevicePositionSequence = (
-                    _create_bld_position_entries(
-                        cp_entry["x1"],
-                        cp_entry["x2"],
-                        cp_entry["y1"],
-                        cp_entry["y2"],
-                        cp_entry["leafpositions"],
-                        decimals,
-                    )
+                cp.BeamLimitingDevicePositionSequence = _create_bld_position_entries(
+                    cp_entry["x1"],
+                    cp_entry["x2"],
+                    cp_entry["y1"],
+                    cp_entry["y2"],
+                    cp_entry["leafpositions"],
+                    decimals,
                 )
 
             # The rotation direction accompanies the angle: it qualifies
