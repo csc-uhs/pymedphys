@@ -385,6 +385,11 @@ def _leaf_boundaries_from_machine(machine, expected_pairs, logger):
 # field and more likely a parse problem than real machine data.
 _PLAUSIBLE_OUTPUT_FACTOR = (0.8, 1.25)
 
+# How closely the interpolated output factor must reproduce Pinnacle's own
+# stored value for the same open field before the interpolation is trusted
+# for a wedged beam, where there is nothing to check it against.
+_OUTPUT_FACTOR_REL_TOL = 1e-3
+
 # Relative and absolute tolerances for the meterset cross-check below.
 _METERSET_REL_TOL = 0.002
 _METERSET_ABS_TOL = 0.1
@@ -488,7 +493,7 @@ def _stored_collimator_output_factor(beam):
     return factor if factor > 0 else None
 
 
-def _collimator_output_factor(beam, machine, wedge_name, logger):
+def _collimator_output_factor(beam, machine, wedge_name, logger, aperture_varies=False):
     """Collimator output factor for the beam's meterset denominator.
 
     For an unwedged beam Pinnacle's stored CollimatorOutputFactor is
@@ -517,16 +522,27 @@ def _collimator_output_factor(beam, machine, wedge_name, logger):
     if not wedged:
         if stored is None:
             return _fallback_output_factor(beam, looked_up, logger)
-        if looked_up is not None and abs(looked_up - stored) > 1e-3 * stored:
-            logger.warning(
-                "Beam '%s': output factor interpolated from the machine "
-                "table is %s but Pinnacle stored %s for the same open "
-                "field. The stored value is used, but the disagreement "
-                "means the table lookup cannot be trusted for wedged "
-                "beams on this machine.",
+        if (
+            looked_up is not None
+            and not aperture_varies
+            and not _lookup_agrees(looked_up, stored)
+        ):
+            # Informational only: this beam exports with Pinnacle's own
+            # value, so its monitor units are unaffected.  It is logged
+            # because the same interpolation is the only available source
+            # for a wedged beam, where there is nothing to check it
+            # against -- see _reject_unreliable_lookup below.
+            logger.info(
+                "Beam '%s' (no wedge): the exported monitor units use "
+                "Pinnacle's stored CollimatorOutputFactor of %s and are "
+                "unaffected. For information: interpolating the machine's "
+                "own output factor table at this field's equivalent square "
+                "gives %s, a %.2f%% difference, so the interpolation does "
+                "not reproduce Pinnacle's lookup on this machine.",
                 beam.get("Name"),
-                looked_up,
                 stored,
+                looked_up,
+                abs(looked_up - stored) / stored * 100,
             )
         return _check_output_factor_range(beam, stored, logger)
 
@@ -540,6 +556,10 @@ def _collimator_output_factor(beam, machine, wedge_name, logger):
             f"would leave the meterset roughly 11% low."
         )
 
+    _reject_unreliable_lookup(
+        beam, machine, stored, equivalent_square, aperture_varies, logger
+    )
+
     logger.debug(
         "Beam '%s': wedge %s, equivalent square %.3f cm, output factor %.6f "
         "(open-field stored value was %s).",
@@ -550,6 +570,88 @@ def _collimator_output_factor(beam, machine, wedge_name, logger):
         stored,
     )
     return _check_output_factor_range(beam, looked_up, logger)
+
+
+def _aperture_varies(control_points):
+    """Whether the MLC aperture changes between a beam's control points.
+
+    It decides whether a single output factor lookup can describe the
+    beam at all.  Collimator scatter depends on the field the collimator
+    defines, so a beam delivered as many small MLC-shaped segments has an
+    effective factor averaged over those segments -- measurably different
+    from, and usually below, the value for the jaw-defined field.  A beam
+    whose aperture never moves (a static field, or a motorized wedge
+    whose two segments share one aperture) has no such averaging, and the
+    single lookup reproduces Pinnacle exactly.
+    """
+    seen = set()
+    for cp in control_points or []:
+        if not isinstance(cp, dict):
+            continue
+        raw = ((cp.get("MLCLeafPositions") or {}).get("RawData") or {}).get("Points[]")
+        if raw is None:
+            continue
+        seen.add(raw)
+        if len(seen) > 1:
+            return True
+    return False
+
+
+def _lookup_agrees(looked_up, stored):
+    return abs(looked_up - stored) <= _OUTPUT_FACTOR_REL_TOL * stored
+
+
+def _reject_unreliable_lookup(
+    beam, machine, stored, equivalent_square, aperture_varies, logger
+):
+    """Refuse a wedged beam whose machine fails the open-field check.
+
+    For a wedged beam the interpolated output factor is the only source:
+    Pinnacle stores the open-field value even on a wedged beam, so there
+    is nothing to compare the wedged figure against.  The open field
+    *can* be checked though, and if the interpolation cannot reproduce
+    Pinnacle's own open-field value on this machine then it cannot be
+    trusted for the wedged one either -- and the resulting meterset error
+    would be invisible in the exported plan.
+
+    Raises
+    ------
+    UnsupportedWedgeError
+        When the open-field lookup disagrees with Pinnacle's stored value.
+    """
+    if aperture_varies:
+        raise UnsupportedWedgeError(
+            f"Beam '{beam.get('Name')}' combines a wedge with an MLC "
+            f"aperture that changes between control points. Its collimator "
+            f"output factor is averaged over the segments, which cannot be "
+            f"reconstructed from the machine's output factor table, and "
+            f"Pinnacle stores only the open-field value on a wedged beam. "
+            f"There is no source for this beam's monitor units, so this "
+            f"trial's RTPLAN export is refused."
+        )
+
+    if stored is None or equivalent_square is None:
+        return
+
+    open_table = _output_factor_table(
+        machine, beam.get("MachineEnergyName"), "No Wedge"
+    )
+    open_lookup = _interpolate_output_factor(open_table, equivalent_square)
+    if open_lookup is None or _lookup_agrees(open_lookup, stored):
+        return
+
+    raise UnsupportedWedgeError(
+        f"Beam '{beam.get('Name')}': interpolating this machine's output "
+        f"factor table at the field's equivalent square "
+        f"({equivalent_square:.2f} cm) gives {open_lookup} for the open "
+        f"field, but Pinnacle stored {stored} — a "
+        f"{abs(open_lookup - stored) / stored * 100:.2f}% difference. The "
+        f"wedged output factor comes from the same interpolation and "
+        f"cannot be checked against anything, so a wedged beam on this "
+        f"machine would carry a meterset error of about that size with "
+        f"nothing in the exported plan to show it. This trial's RTPLAN "
+        f"export is refused."
+    )
 
 
 def _fallback_output_factor(beam, looked_up, logger):
@@ -2048,7 +2150,11 @@ def convert_plan_for_trial(
         prescripdose = beam["MonitorUnitInfo"]["PrescriptionDose"]
         normdose = beam["MonitorUnitInfo"]["NormalizedDose"]
         collimator_of = _collimator_output_factor(
-            beam, machine, beam_wedge_name, plan.logger
+            beam,
+            machine,
+            beam_wedge_name,
+            plan.logger,
+            _aperture_varies(cp_manager["ControlPointList"]),
         )
         transmission = _total_transmission_fraction(beam, plan.logger)
 
