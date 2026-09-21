@@ -123,7 +123,11 @@ def _truncate_sh(value, logger=None, tag=""):
 def _format_ds(value):
     """Format a float for a DICOM DS (Decimal String, max 16 chars)."""
     text = f"{float(value):.6f}".rstrip("0").rstrip(".")
-    if text in ("", "-"):
+    # "-0" is a legal DS, but it is noise: it comes from IEEE negative zero
+    # (the -X MLC bank is built as -v * 10, so a closed leaf at 0.0 becomes
+    # -0.0) or from a tiny negative value that rounds away at 6 places.
+    # Neither carries meaning; the value is exactly zero.
+    if text in ("", "-", "-0"):
         text = "0"
     return text[:16]
 
@@ -1594,9 +1598,18 @@ def _create_wedge_sequence(wedge_info):
     wedge.WedgeAngle = wedge_info["angle"]
     wedge.WedgeID = wedge_info["name"]
     wedge.WedgeOrientation = wedge_info["orientation"]
-    # WedgeFactor (Type 3, VR=DS) is omitted rather than written as "": an
-    # empty string is not a valid Decimal String. Populate with the real
-    # factor from Pinnacle data when it becomes available.
+    # WedgeFactor (300A,00D6) is Type 2 in the RT Beams Module Wedge
+    # Sequence: it must be present, but may be zero-length.  A zero-length
+    # value is valid for every VR, DS included, so it is written empty
+    # (None -> zero-length element) rather than omitted.
+    #
+    # It is deliberately not filled in.  It is defined as the nominal
+    # factor under machine calibration conditions, and nothing in the
+    # Pinnacle plan data carries a validated value for it; for a motorized
+    # wedge in particular the delivered wedge effect depends on the
+    # wedged/open segment split, not a single factor.  An invented number
+    # here would be a dosimetric claim the plan cannot back up.
+    wedge.WedgeFactor = None
     seq.append(wedge)
     return seq
 
