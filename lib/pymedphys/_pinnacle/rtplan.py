@@ -1509,17 +1509,17 @@ def _collimation_decimals(machine):
     }
 
 
-def _create_bld_position_entries(x1, x2, y1, y2, leafpositions, decimals=None):
-    """Create the BeamLimitingDevicePositionSequence items for a control point.
+def _bld_positions(x1, x2, y1, y2, leafpositions, decimals=None):
+    """Formatted LeafJawPositions per beam limiting device for one control point.
 
-    Returns a Sequence containing ASYMX and ASYMY entries, plus an MLCX
-    entry when the beam has MLC leaf data (jaw-only beams legitimately
-    have no MLCX device).
+    Returns a dict, in BeamLimitingDeviceSequence order, mapping the
+    RTBeamLimitingDeviceType to the list of DS strings that would be
+    written.  MLCX is only present when the beam has MLC leaf data
+    (jaw-only beams legitimately have no MLCX device).
 
     *decimals* is the mapping returned by :func:`_collimation_decimals`;
     when omitted the values are written unrounded.
     """
-    bld_seq = _new_sequence()
     decimals = decimals or {}
 
     def position(value, device):
@@ -1533,31 +1533,104 @@ def _create_bld_position_entries(x1, x2, y1, y2, leafpositions, decimals=None):
         # Pinnacle's own export unreadable.
         return _format_ds(value)
 
-    asymx = _new_dataset()
-    asymx.RTBeamLimitingDeviceType = "ASYMX"
-    asymx.LeafJawPositions = [position(x1, "x"), position(x2, "x")]
-    bld_seq.append(asymx)
-
-    asymy = _new_dataset()
-    asymy.RTBeamLimitingDeviceType = "ASYMY"
-    asymy.LeafJawPositions = [position(y1, "y"), position(y2, "y")]
-    bld_seq.append(asymy)
-
+    positions = {
+        "ASYMX": [position(x1, "x"), position(x2, "x")],
+        "ASYMY": [position(y1, "y"), position(y2, "y")],
+    }
     if leafpositions:
-        mlcx = _new_dataset()
-        mlcx.RTBeamLimitingDeviceType = "MLCX"
-        mlcx.LeafJawPositions = [position(v, "mlc") for v in leafpositions]
-        bld_seq.append(mlcx)
+        positions["MLCX"] = [position(v, "mlc") for v in leafpositions]
+    return positions
 
+
+def _cp_bld_positions(cp_entry, decimals=None):
+    """:func:`_bld_positions` for a parsed control point entry."""
+    return _bld_positions(
+        cp_entry["x1"],
+        cp_entry["x2"],
+        cp_entry["y1"],
+        cp_entry["y2"],
+        cp_entry["leafpositions"],
+        decimals,
+    )
+
+
+def _create_bld_position_entries(
+    x1, x2, y1, y2, leafpositions, decimals=None, devices=None
+):
+    """Create the BeamLimitingDevicePositionSequence items for a control point.
+
+    Returns a Sequence containing ASYMX and ASYMY entries, plus an MLCX
+    entry when the beam has MLC leaf data.
+
+    *devices*, when given, restricts the items to those device types --
+    used on subsequent control points, which may only carry the devices
+    whose positions change during the beam.  ``None`` writes every device,
+    as the first control point requires.
+    """
+    bld_seq = _new_sequence()
+    positions = _bld_positions(x1, x2, y1, y2, leafpositions, decimals)
+    for device_type, values in positions.items():
+        if devices is not None and device_type not in devices:
+            continue
+        item = _new_dataset()
+        item.RTBeamLimitingDeviceType = device_type
+        item.LeafJawPositions = values
+        bld_seq.append(item)
     return bld_seq
 
 
-def _collimation_changed(previous, current):
-    """True when any jaw or leaf position differs between control points."""
-    for key in ("x1", "x2", "y1", "y2"):
-        if previous.get(key) != current.get(key):
-            return True
-    return previous.get("leafpositions") != current.get("leafpositions")
+def _bld_devices_changing_during_beam(cp_entries, decimals=None):
+    """Device types whose written positions change anywhere in the beam.
+
+    *cp_entries* holds the parsed entry behind each DICOM control point,
+    in order.  Positions are compared as they would be written (rounded
+    and formatted), so float noise below the machine's display precision
+    cannot make a stationary device look as if it moves.
+    """
+    changing = set()
+    first = None
+    for entry in cp_entries:
+        positions = _cp_bld_positions(entry, decimals)
+        if first is None:
+            first = positions
+            continue
+        for device_type in set(first) | set(positions):
+            if positions.get(device_type) != first.get(device_type):
+                changing.add(device_type)
+    return changing
+
+
+def _set_subsequent_cp_bld_positions(cp, cp_entry, changing, decimals=None):
+    """Write BeamLimitingDevicePositionSequence on a non-first control point.
+
+    DICOM (RT Beams Module, 300A,011A): after the first control point the
+    sequence is required when the beam limiting device values change
+    during the beam, and "the Items present shall be only those whose
+    values change during the Beam".  The rule is per beam, not per
+    control point, so:
+
+    * a device that never moves (the jaws of a step & shoot IMRT beam,
+      every device of a static or motorized wedge field) is written only
+      on the first control point;
+    * a device that does move is written on every control point, even
+      one where it holds position, so each control point states it;
+    * a beam in which nothing moves carries no sequence after the first
+      control point, as in Pinnacle's own export.
+    """
+    if not changing:
+        return
+    seq = _create_bld_position_entries(
+        cp_entry["x1"],
+        cp_entry["x2"],
+        cp_entry["y1"],
+        cp_entry["y2"],
+        cp_entry["leafpositions"],
+        decimals,
+        devices=changing,
+    )
+    # "One or more Items shall be included": never write an empty sequence.
+    if len(seq) > 0:
+        cp.BeamLimitingDevicePositionSequence = seq
 
 
 def _set_cp_ssd(cp, cp_entry):
@@ -2366,6 +2439,13 @@ def _build_step_and_shoot_control_points(
     )
     beam_ds.FinalCumulativeMetersetWeight = _format_ds(final_weight)
 
+    # Devices whose positions change during the beam; DICOM CP j belongs
+    # to Pinnacle segment j // 2.
+    changing_devices = _bld_devices_changing_during_beam(
+        [cp_data_list[min(j // 2, len(cp_data_list) - 1)] for j in range(total_cps)],
+        decimals,
+    )
+
     # --- Pass 2: build the control points ---
     for j in range(total_cps):
         cp = _new_dataset()
@@ -2394,16 +2474,10 @@ def _build_step_and_shoot_control_points(
                 _cp_wedge_position(cp_entry, beam_wedge_name),
             )
         else:
-            # Subsequent control points: this segment's own jaw and MLC
-            # positions (jaws can change between segments too).
-            cp.BeamLimitingDevicePositionSequence = _create_bld_position_entries(
-                cp_entry["x1"],
-                cp_entry["x2"],
-                cp_entry["y1"],
-                cp_entry["y2"],
-                cp_entry["leafpositions"],
-                decimals,
-            )
+            # Subsequent control points: this segment's own positions for
+            # the devices that move during the beam (jaws can change
+            # between segments too); stationary devices are omitted.
+            _set_subsequent_cp_bld_positions(cp, cp_entry, changing_devices, decimals)
             if numwedges > 0:
                 # A motorized wedge moves between segments, so every
                 # control point states where it is.
@@ -2506,6 +2580,13 @@ def _build_non_ss_control_points(
         cp_data_list, total_cps, gantryrotdir, beam["Name"], plan.logger
     )
 
+    # Devices whose positions change during the beam (the appended final
+    # CP repeats the last Pinnacle aperture).
+    changing_devices = _bld_devices_changing_during_beam(
+        [cp_data_list[min(j, len(cp_data_list) - 1)] for j in range(total_cps)],
+        decimals,
+    )
+
     for j in range(total_cps):
         cp = _new_dataset()
         beam_ds.ControlPointSequence.append(cp)
@@ -2534,24 +2615,15 @@ def _build_non_ss_control_points(
                 _cp_wedge_position(cp_entry, beam_wedge_name),
             )
         else:
-            # Subsequent control points carry only what changed since the
-            # previous one, which is both what DICOM asks for and what
-            # Pinnacle's own export does: a static beam's terminating
-            # control point holds nothing but its cumulative weight.
-            # Repeating unchanged collimation is legal but asserts a
-            # machine movement that does not happen, and buries the
-            # control points that do move.
+            # Subsequent control points carry only what changes, which is
+            # both what DICOM asks for and what Pinnacle's own export does:
+            # a static beam's terminating control point holds nothing but
+            # its cumulative weight.  For the beam limiting devices the
+            # rule is per beam, not per control point: see
+            # _set_subsequent_cp_bld_positions.
             previous = cp_data_list[min(j - 1, len(cp_data_list) - 1)]
 
-            if _collimation_changed(previous, cp_entry):
-                cp.BeamLimitingDevicePositionSequence = _create_bld_position_entries(
-                    cp_entry["x1"],
-                    cp_entry["x2"],
-                    cp_entry["y1"],
-                    cp_entry["y2"],
-                    cp_entry["leafpositions"],
-                    decimals,
-                )
+            _set_subsequent_cp_bld_positions(cp, cp_entry, changing_devices, decimals)
 
             # The rotation direction accompanies the angle: it qualifies
             # the movement to the next control point, so writing one

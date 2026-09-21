@@ -254,14 +254,10 @@ class DeliveryDicom(DeliveryBase):
 
         control_points = beam.ControlPointSequence
 
-        beam_limiting_device_position_sequences = (
-            _pmp_rtplan.get_cp_attribute_leaning_on_prior(
-                control_points, "BeamLimitingDevicePositionSequence"
-            )
-        )
-
-        dicom_mlcs = _pmp_rtplan.get_leaf_jaw_positions_for_type(
-            beam_limiting_device_position_sequences, "MLCX"
+        # Per device type: a subsequent control point may carry only the
+        # devices that move during the beam (e.g. MLCX without the jaws).
+        dicom_mlcs = _pmp_rtplan.get_leaf_jaw_positions_for_type_leaning_on_prior(
+            control_points, "MLCX"
         )
 
         mlcs = [
@@ -273,8 +269,8 @@ class DeliveryDicom(DeliveryBase):
             for mlc in dicom_mlcs
         ]
 
-        dicom_jaw = _pmp_rtplan.get_leaf_jaw_positions_for_type(
-            beam_limiting_device_position_sequences, "ASYMY"
+        dicom_jaw = _pmp_rtplan.get_leaf_jaw_positions_for_type_leaning_on_prior(
+            control_points, "ASYMY"
         )
 
         jaw = np.array(dicom_jaw)

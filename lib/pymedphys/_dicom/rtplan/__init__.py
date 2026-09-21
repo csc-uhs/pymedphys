@@ -15,6 +15,7 @@ from .core import (
     get_fraction_group_index,
     get_gantry_angles_from_dicom,
     get_leaf_jaw_positions_for_type,
+    get_leaf_jaw_positions_for_type_leaning_on_prior,
     get_metersets_from_dicom,
     get_surface_entry_point,
     get_surface_entry_point_with_fallback,

@@ -224,6 +224,50 @@ def get_leaf_jaw_positions_for_type(
     return leaf_jaw_positions
 
 
+def get_leaf_jaw_positions_for_type_leaning_on_prior(
+    control_point_sequence, rt_beam_limiting_device_type
+):
+    """LeafJawPositions of one device type at every control point.
+
+    After the first control point, DICOM only includes a
+    BeamLimitingDevicePositionSequence item for the devices whose
+    positions change during the beam (RT Beams Module, 300A,011A), so a
+    device can be absent from a subsequent control point's sequence -- or
+    the sequence absent altogether.  Absence means the device holds the
+    position it last had, so that position is carried forward per
+    device type.  Leaning on the prior control point for the whole
+    sequence instead (``get_cp_attribute_leaning_on_prior``) fails on a
+    conformant plan whose subsequent control points carry the MLC alone.
+    """
+    current = None
+    leaf_jaw_positions = []
+
+    for control_point in control_point_sequence:
+        sequence = getattr(control_point, "BeamLimitingDevicePositionSequence", None)
+        matching_type = [
+            item
+            for item in (sequence or [])
+            if item.RTBeamLimitingDeviceType == rt_beam_limiting_device_type
+        ]
+
+        if len(matching_type) > 1:
+            raise ValueError(
+                "Expected at most one item per control point for a given collimator"
+            )
+
+        if matching_type:
+            current = matching_type[0].LeafJawPositions
+        elif current is None:
+            raise ValueError(
+                f"The first control point has no {rt_beam_limiting_device_type} "
+                "item in its BeamLimitingDevicePositionSequence"
+            )
+
+        leaf_jaw_positions.append(current)
+
+    return leaf_jaw_positions
+
+
 def get_fraction_group_index(dicom_dataset, fraction_group_number):
     fraction_group_numbers = [
         fraction_group.FractionGroupNumber
