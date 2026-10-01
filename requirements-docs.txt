@@ -348,7 +348,7 @@ tomli==2.4.1 ; python_full_version < '3.11'
     # via sphinx
 tomlkit==0.15.1
     # via pymedphys
-tornado==6.5.8
+tornado==6.5.9
     # via
     #   ipykernel
     #   jupyter-client
@@ -377,7 +377,7 @@ typing-extensions==4.16.0
     #   sqlalchemy
 uc-micro-py==2.0.0
     # via linkify-it-py
-urllib3==2.7.0
+urllib3==2.8.0
     # via
     #   pymedphys
     #   requests
