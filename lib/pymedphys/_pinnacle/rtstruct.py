@@ -47,8 +47,13 @@ from pymedphys._dicom.create import set_default_transfer_syntax
 from pymedphys._imports import pydicom
 from pymedphys._pinnacle.pinnacle_exceptions import MissingCTImageError
 
-from .constants import (GImplementationClassUID, GTransferSyntaxUID,
-                        RTSTRUCTModality, RTStructSOPClassUID, colors)
+from .constants import (
+    GImplementationClassUID,
+    GTransferSyntaxUID,
+    RTSTRUCTModality,
+    RTStructSOPClassUID,
+    colors,
+)
 from .pinnacle_metadata import apply_approval_status, apply_equipment_stamps
 
 # DICOM LO (Long String) maximum length — used for SeriesDescription.
@@ -70,6 +75,7 @@ def _set_trial_series_description(ds, trial_name):
     if len(combined) > _DICOM_LO_MAX:
         combined = combined[: _DICOM_LO_MAX - 3].rstrip() + "..."
     ds.SeriesDescription = combined
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -641,7 +647,10 @@ def convert_struct_for_trial(
             "StructureSetLabel value %r is %d chars, exceeding the DICOM SH "
             "limit of %d; truncated to %r (full name retained in "
             "SeriesDescription).",
-            _label, len(_label), _DICOM_SH_MAX, _label[:_DICOM_SH_MAX],
+            _label,
+            len(_label),
+            _DICOM_SH_MAX,
+            _label[:_DICOM_SH_MAX],
         )
         _label = _label[:_DICOM_SH_MAX]
     ds.StructureSetLabel = _label
