@@ -186,7 +186,7 @@ docs = [
   #   through this tree (docutils, markdown-it-py) are pinned directly in
   #   [tool.uv] constraint-dependencies instead, so we get the fixes while
   #   staying on the 1.x engine.  Revisit as a planned docs migration.
-  "jupyter-book>=1.0.4.post1,<2.0.0",
+  "jupyter-book>=1.0.4.post1,<3.0.0",
   "matplotlib",
   "networkx",
   "numba",
@@ -262,7 +262,7 @@ all = [
     "doc8",
     "imageio[tifffile]",
     "ipython>=7.31.1",
-    "jupyter-book>=1.0.4.post1,<2.0.0",
+    "jupyter-book>=1.0.4.post1,<3.0.0",
     "keyring",
     "matplotlib",
     "natsort",
