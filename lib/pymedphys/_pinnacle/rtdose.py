@@ -47,6 +47,7 @@ import time
 from pymedphys._dicom.orientation import IMAGE_ORIENTATION_MAP
 from pymedphys._imports import numpy as np
 from pymedphys._imports import pydicom
+
 # DICOM DS (Decimal String) maximum length — PS3.5 Table 6.2-1.
 _DICOM_DS_MAX = 16
 
@@ -536,7 +537,8 @@ def _convert_dose_for_trial(
     # it and produces a non-conformant value.
     ds.DoseGridScaling = _format_ds_value(scale)
     plan.logger.debug(
-        "Dose Grid Scaling: %s (DS-encoded: %s)", scale, ds.DoseGridScaling)
+        "Dose Grid Scaling: %s (DS-encoded: %s)", scale, ds.DoseGridScaling
+    )
 
     if scale != 0:
         # Clamp to the unsigned 16-bit range so the encoded values agree with
